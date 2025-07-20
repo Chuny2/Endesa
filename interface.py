@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QGridLayout, QFileDialog, QMessageBox, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QFont
 
 from endesa import EndesaClient
@@ -230,8 +230,13 @@ class BatchProcessorThread(QThread):
             self.progress_updated.emit(f"ERROR: Failed to write to file - {str(e)}")
     
     def stop(self):
-        """Stop the processing."""
-        self.running = False
+        """Stop the processing safely."""
+        try:
+            self.running = False
+            # The thread will naturally exit when the while loop condition becomes false
+        except Exception as e:
+            # If anything goes wrong, just set running to False
+            self.running = False
 
 
 class EndesaInterface(QMainWindow):
@@ -375,53 +380,107 @@ class EndesaInterface(QMainWindow):
         
         # Configuration group
         config_group = QGroupBox("Configuration")
+        config_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #404040;
+                border-radius: 8px;
+                margin-top: 1ex;
+                padding-top: 10px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px 0 8px;
+                color: #00b4d8;
+                font-size: 14px;
+                font-weight: bold;
+            }
+        """)
         config_layout = QVBoxLayout(config_group)
-        config_layout.setSpacing(20)
+        config_layout.setSpacing(12)
+        config_layout.setContentsMargins(15, 15, 15, 15)
         
         # Credentials file selection section
         file_section = QWidget()
+        file_section.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #3a3a3a, stop:1 #2a2a2a);
+                border: 1px solid #505050;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
         file_layout = QHBoxLayout(file_section)
-        file_layout.setSpacing(15)
-        file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.setSpacing(10)
+        file_layout.setContentsMargins(10, 10, 10, 10)
         
-        self.credentials_label = QLabel("Credentials File:")
-        self.credentials_label.setStyleSheet("color: #00b4d8; font-size: 14px; font-weight: bold; min-width: 120px;")
+        # File icon and label
+        file_header = QWidget()
+        file_header_layout = QVBoxLayout(file_header)
+        file_header_layout.setSpacing(2)
+        file_header_layout.setContentsMargins(0, 0, 0, 0)
         
+        self.credentials_label = QLabel("📁 Credentials File")
+        self.credentials_label.setStyleSheet("""
+            color: #00b4d8; 
+            font-size: 13px; 
+            font-weight: bold;
+            margin-bottom: 2px;
+        """)
+        
+        file_desc = QLabel("Select the file containing email:password credentials")
+        file_desc.setStyleSheet("color: #888888; font-size: 10px; font-style: italic;")
+        
+        file_header_layout.addWidget(self.credentials_label)
+        file_header_layout.addWidget(file_desc)
+        
+        # File path display
         self.credentials_path_label = QLabel("No file selected")
         self.credentials_path_label.setStyleSheet("""
             color: #888888; 
             font-style: italic; 
-            padding: 12px 16px; 
-            border: 2px solid #404040; 
+            padding: 8px 12px; 
+            border: 2px solid #505050; 
             border-radius: 6px; 
-            background-color: #2d2d2d;
-            font-size: 13px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                stop:0 #2d2d2d, stop:1 #1e1e1e);
+            font-size: 11px;
+            min-height: 35px;
         """)
-        self.credentials_path_label.setMinimumHeight(45)
+        self.credentials_path_label.setMinimumHeight(35)
         
-        self.browse_button = QPushButton("Browse")
-        self.browse_button.setMinimumWidth(100)
-        self.browse_button.setMinimumHeight(45)
+        # Browse button
+        self.browse_button = QPushButton("🔍 Browse")
+        self.browse_button.setMinimumWidth(80)
+        self.browse_button.setMinimumHeight(35)
         self.browse_button.setStyleSheet("""
             QPushButton {
-                background-color: #00b4d8;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #00b4d8, stop:1 #0096c7);
                 color: white;
                 border: none;
-                padding: 12px 20px;
+                padding: 8px 15px;
                 border-radius: 6px;
                 font-weight: bold;
-                font-size: 13px;
+                font-size: 11px;
             }
             QPushButton:hover {
-                background-color: #0096c7;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #0096c7, stop:1 #0077b6);
             }
             QPushButton:pressed {
-                background-color: #0077b6;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #0077b6, stop:1 #005a8b);
             }
         """)
         self.browse_button.clicked.connect(self.browse_credentials_directory)
         
-        file_layout.addWidget(self.credentials_label)
+        file_layout.addWidget(file_header)
         file_layout.addWidget(self.credentials_path_label, 1)  # Stretch to fill space
         file_layout.addWidget(self.browse_button)
         
@@ -429,69 +488,121 @@ class EndesaInterface(QMainWindow):
         
         # Thread count selection section
         thread_section = QWidget()
+        thread_section.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #3a3a3a, stop:1 #2a2a2a);
+                border: 1px solid #505050;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
         thread_layout = QHBoxLayout(thread_section)
-        thread_layout.setSpacing(15)
-        thread_layout.setContentsMargins(0, 0, 0, 0)
+        thread_layout.setSpacing(10)
+        thread_layout.setContentsMargins(10, 10, 10, 10)
         
-        self.threads_label = QLabel("Number of Threads:")
-        self.threads_label.setStyleSheet("color: #00b4d8; font-size: 14px; font-weight: bold; min-width: 120px;")
+        # Thread header
+        thread_header = QWidget()
+        thread_header_layout = QVBoxLayout(thread_header)
+        thread_header_layout.setSpacing(2)
+        thread_header_layout.setContentsMargins(0, 0, 0, 0)
         
+        self.threads_label = QLabel("⚡ Thread Count")
+        self.threads_label.setStyleSheet("""
+            color: #00b4d8; 
+            font-size: 13px; 
+            font-weight: bold;
+            margin-bottom: 2px;
+        """)
+        
+        thread_desc = QLabel("Number of parallel processing threads")
+        thread_desc.setStyleSheet("color: #888888; font-size: 10px; font-style: italic;")
+        
+        thread_header_layout.addWidget(self.threads_label)
+        thread_header_layout.addWidget(thread_desc)
+        
+        # Thread spinbox with modern styling
         self.threads_spinbox = QSpinBox()
         self.threads_spinbox.setRange(1, 200)
         self.threads_spinbox.setValue(50)
-        self.threads_spinbox.setMinimumWidth(200)
-        self.threads_spinbox.setMinimumHeight(45)
+        self.threads_spinbox.setMinimumWidth(120)
+        self.threads_spinbox.setMinimumHeight(35)
         self.threads_spinbox.setStyleSheet("""
             QSpinBox {
-                padding: 12px 16px;
-                border: 2px solid #404040;
+                padding: 8px 12px;
+                border: 2px solid #505050;
                 border-radius: 6px;
-                background-color: #2d2d2d;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #2d2d2d, stop:1 #1e1e1e);
                 color: #ffffff;
-                font-size: 13px;
+                font-size: 11px;
                 font-weight: bold;
             }
             QSpinBox:focus {
                 border: 2px solid #00b4d8;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #3a3a3a, stop:1 #2a2a2a);
             }
             QSpinBox::up-button, QSpinBox::down-button {
-                background-color: #404040;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #505050, stop:1 #404040);
                 border: none;
                 border-radius: 3px;
-                width: 25px;
-                height: 20px;
+                width: 20px;
+                height: 15px;
                 margin: 2px;
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #00b4d8;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #00b4d8, stop:1 #0096c7);
             }
             QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
-                background-color: #0077b6;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #0077b6, stop:1 #005a8b);
             }
             QSpinBox::up-arrow {
                 image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-bottom: 5px solid #ffffff;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 4px solid #ffffff;
                 margin-top: 2px;
             }
             QSpinBox::down-arrow {
                 image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #ffffff;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 4px solid #ffffff;
                 margin-bottom: 2px;
             }
         """)
         
-        # Add thread info label
-        thread_info_label = QLabel("Recommended: 10-100 threads for optimal performance")
-        thread_info_label.setStyleSheet("color: #888888; font-size: 12px; font-style: italic;")
+        # Thread info panel
+        thread_info_panel = QWidget()
+        thread_info_panel.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #2a2a2a, stop:1 #1e1e1e);
+                border: 1px solid #404040;
+                border-radius: 4px;
+                padding: 6px;
+            }
+        """)
+        thread_info_layout = QVBoxLayout(thread_info_panel)
+        thread_info_layout.setSpacing(2)
+        thread_info_layout.setContentsMargins(6, 6, 6, 6)
         
-        thread_layout.addWidget(self.threads_label)
+        thread_info_title = QLabel("💡 Performance Tips")
+        thread_info_title.setStyleSheet("color: #00b4d8; font-size: 10px; font-weight: bold;")
+        
+        thread_info_label = QLabel("• 10-50: Safe\n• 50-100: High perf\n• 100+: Max speed")
+        thread_info_label.setStyleSheet("color: #888888; font-size: 9px; line-height: 1.2;")
+        
+        thread_info_layout.addWidget(thread_info_title)
+        thread_info_layout.addWidget(thread_info_label)
+        
+        thread_layout.addWidget(thread_header)
         thread_layout.addWidget(self.threads_spinbox)
-        thread_layout.addWidget(thread_info_label)
-        thread_layout.addStretch()  # Push everything to the left
+        thread_layout.addWidget(thread_info_panel)
         
         config_layout.addWidget(thread_section)
         
@@ -499,62 +610,108 @@ class EndesaInterface(QMainWindow):
         
         # Control group
         control_group = QGroupBox("Controls")
+        control_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #404040;
+                border-radius: 8px;
+                margin-top: 1ex;
+                padding-top: 10px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 8px 0 8px;
+                color: #00b4d8;
+                font-size: 14px;
+                font-weight: bold;
+            }
+        """)
         control_layout = QHBoxLayout(control_group)
-        control_layout.setSpacing(20)
+        control_layout.setSpacing(15)
+        control_layout.setContentsMargins(15, 15, 15, 15)
         
-        self.start_button = QPushButton("Start Processing")
+        # Control buttons container
+        control_buttons = QWidget()
+        control_buttons.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #3a3a3a, stop:1 #2a2a2a);
+                border: 1px solid #505050;
+                border-radius: 6px;
+                padding: 12px;
+            }
+        """)
+        control_buttons_layout = QHBoxLayout(control_buttons)
+        control_buttons_layout.setSpacing(15)
+        control_buttons_layout.setContentsMargins(12, 12, 12, 12)
+        
+        self.start_button = QPushButton("▶ Start Processing")
         self.start_button.clicked.connect(self.start_processing)
-        self.start_button.setMinimumHeight(50)
+        self.start_button.setMinimumHeight(45)
         self.start_button.setStyleSheet("""
             QPushButton {
-                background-color: #00b4d8;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #28a745, stop:1 #20c997);
                 color: white;
                 border: none;
-                padding: 15px 30px;
+                padding: 12px 25px;
                 border-radius: 8px;
                 font-weight: bold;
-                font-size: 16px;
+                font-size: 14px;
             }
             QPushButton:hover {
-                background-color: #0096c7;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #20c997, stop:1 #17a2b8);
             }
             QPushButton:pressed {
-                background-color: #0077b6;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #17a2b8, stop:1 #138496);
             }
             QPushButton:disabled {
-                background-color: #404040;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #404040, stop:1 #2a2a2a);
                 color: #666666;
             }
         """)
         
-        self.stop_button = QPushButton("Stop Processing")
+        self.stop_button = QPushButton("⏹ Stop Processing")
         self.stop_button.clicked.connect(self.stop_processing)
         self.stop_button.setEnabled(False)
-        self.stop_button.setMinimumHeight(50)
+        self.stop_button.setMinimumHeight(45)
         self.stop_button.setStyleSheet("""
             QPushButton {
-                background-color: #dc3545;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #dc3545, stop:1 #c82333);
                 color: white;
                 border: none;
-                padding: 15px 30px;
+                padding: 12px 25px;
                 border-radius: 8px;
                 font-weight: bold;
-                font-size: 16px;
+                font-size: 14px;
             }
             QPushButton:hover {
-                background-color: #c82333;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #c82333, stop:1 #bd2130);
             }
             QPushButton:pressed {
-                background-color: #bd2130;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #bd2130, stop:1 #a71e2a);
             }
             QPushButton:disabled {
-                background-color: #404040;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #404040, stop:1 #2a2a2a);
                 color: #666666;
             }
         """)
         
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.stop_button)
+        control_buttons_layout.addWidget(self.start_button)
+        control_buttons_layout.addWidget(self.stop_button)
+        
+        control_layout.addWidget(control_buttons)
         
         layout.addWidget(control_group)
         
@@ -798,23 +955,51 @@ class EndesaInterface(QMainWindow):
             """)
     
     def browse_credentials_directory(self):
-        """Open file dialog to select credentials file."""
+        """Open native file dialog to select credentials file."""
+        import platform
+        
+        # Set environment variables to force native file dialog
+        if platform.system() == "Linux":
+            # Linux: Force native file dialog (tunar, nautilus, etc.)
+            os.environ['QT_QPA_PLATFORM'] = 'xcb'
+            os.environ['QT_QPA_PLATFORMTHEME'] = ''
+            os.environ['GTK_USE_PORTAL'] = '1'
+            # Try to detect the file manager
+            if os.path.exists('/usr/bin/tunar'):
+                os.environ['XDG_CURRENT_DESKTOP'] = 'XFCE'
+            elif os.path.exists('/usr/bin/nautilus'):
+                os.environ['XDG_CURRENT_DESKTOP'] = 'GNOME'
+            elif os.path.exists('/usr/bin/dolphin'):
+                os.environ['XDG_CURRENT_DESKTOP'] = 'KDE'
+        elif platform.system() == "Windows":
+            # Windows: Use native Windows file dialog
+            os.environ['QT_QPA_PLATFORM'] = 'windows'
+            os.environ['QT_QPA_PLATFORMTHEME'] = ''
+        
+        # Try to get the current directory or home directory
+        start_dir = os.getcwd()
+        if not os.path.exists(start_dir):
+            start_dir = os.path.expanduser("~")
+        
         file_path, _ = QFileDialog.getOpenFileName(
             self, 
             "Select Credentials File", 
-            "",
+            start_dir,
             "Text Files (*.txt);;All Files (*)"
         )
+        
         if file_path:
             self.credentials_path_label.setText(file_path)
             self.credentials_path_label.setStyleSheet("""
                 color: #00b4d8; 
                 font-weight: bold; 
-                padding: 12px 16px; 
+                padding: 8px 12px; 
                 border: 2px solid #00b4d8; 
                 border-radius: 6px; 
-                background-color: #2d2d2d;
-                font-size: 13px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                font-size: 11px;
+                min-height: 35px;
             """)
     
     def start_processing(self):
@@ -866,16 +1051,52 @@ class EndesaInterface(QMainWindow):
         self.rate_label.setText("Rate: 0 req/s")
     
     def stop_processing(self):
-        """Stop the batch processing."""
-        if self.processor_thread and self.processor_thread.isRunning():
-            self.processor_thread.stop()
-            self.processor_thread.wait()
-            self.update_status("Processing stopped by user")
-        
-        # Update UI
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.progress_bar.setVisible(False)
+        """Stop the batch processing safely."""
+        try:
+            if self.processor_thread and self.processor_thread.isRunning():
+                # Signal the thread to stop
+                self.processor_thread.stop()
+                
+                # Update UI immediately
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.progress_bar.setVisible(False)
+                self.update_status("Stopping processing...")
+                
+                # Use a timer to check if thread finished instead of blocking wait
+                self.stop_timer = QTimer()
+                self.stop_timer.timeout.connect(self.check_thread_finished)
+                self.stop_timer.start(100)  # Check every 100ms
+                
+        except Exception as e:
+            # If anything goes wrong, just reset the UI
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.progress_bar.setVisible(False)
+            self.update_status("Processing stopped")
+    
+    def check_thread_finished(self):
+        """Check if the processing thread has finished."""
+        try:
+            if self.processor_thread and not self.processor_thread.isRunning():
+                # Thread has finished, stop the timer and update UI
+                if hasattr(self, 'stop_timer'):
+                    self.stop_timer.stop()
+                    self.stop_timer.deleteLater()
+                
+                self.update_status("Processing stopped by user")
+                self.processor_thread = None
+                
+        except Exception as e:
+            # If anything goes wrong, just reset the UI
+            if hasattr(self, 'stop_timer'):
+                self.stop_timer.stop()
+                self.stop_timer.deleteLater()
+            
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.progress_bar.setVisible(False)
+            self.update_status("Processing stopped")
     
     def clear_success_table(self):
         """Clear the success table."""
