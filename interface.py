@@ -11,13 +11,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
     QPushButton, QLabel, QSpinBox, QTextEdit, QProgressBar, 
     QGroupBox, QGridLayout, QFileDialog, QMessageBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QFont
 
 from endesa import EndesaClient
 from config import read_credentials
+from vpn_manager import VPNManager
 
 
 class BatchProcessorThread(QThread):
@@ -28,12 +29,17 @@ class BatchProcessorThread(QThread):
     stats_updated = pyqtSignal(int, int, int, int, float)  # success, failed, banned, total, rate
     progress_percentage = pyqtSignal(int)  # Progress percentage
     finished_processing = pyqtSignal(int, int, float)
+    vpn_status_updated = pyqtSignal(str)  # VPN status updates
     
-    def __init__(self, credentials_file: str, max_workers: int, output_file: str):
+    def __init__(self, credentials_file: str, max_workers: int, output_file: str, max_retries: int = 3, retry_delay: float = 2.0, use_vpn: bool = False):
         super().__init__()
         self.credentials_file = credentials_file
         self.max_workers = max_workers
         self.output_file = output_file
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.use_vpn = use_vpn
+        self.vpn_manager = None
         self.running = True
         self.start_time = None
         
@@ -72,93 +78,164 @@ class BatchProcessorThread(QThread):
             failed = 0
             banned = 0
             
-            # Use ThreadPoolExecutor for true parallel processing
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all tasks to the thread pool
-                future_to_credential = {}
-                for email, password, line_num in credentials:
-                    if not self.running:
-                        break
+            # Initialize VPN if enabled
+            if self.use_vpn:
+                try:
+                    self.vpn_manager = VPNManager()
+                    self.progress_updated.emit("VPN initialized successfully")
                     
-                    future = executor.submit(self._process_single_credential, email, password, line_num)
-                    future_to_credential[future] = (email, line_num)
+                    # Connect to first VPN location before starting processing
+                    self.progress_updated.emit("Connecting to initial VPN location...")
+                    if self.vpn_manager.connect_smart():
+                        # Verify initial connection
+                        if self.vpn_manager._verify_connection():
+                            initial_ip = self.vpn_manager.get_current_ip()
+                            self.progress_updated.emit(f"Initial VPN connection established - IP: {initial_ip}")
+                        else:
+                            self.progress_updated.emit("Initial VPN connection verification failed, continuing without VPN")
+                            self.use_vpn = False
+                    else:
+                        self.progress_updated.emit("Initial VPN connection failed, continuing without VPN")
+                        self.use_vpn = False
+                        
+                except Exception as e:
+                    self.progress_updated.emit(f"VPN initialization failed: {e}")
+                    self.use_vpn = False
+            
+            # Process all credentials continuously without waiting for batch completion
+            if self.use_vpn:
+                # VPN mode: Process batch -> Wait completion -> Rotate IP -> Start next batch immediately
+                remaining_credentials = credentials.copy()
+                batch_count = 0
                 
-                # Process completed tasks immediately as they finish (non-blocking)
-                while future_to_credential:
-                    if not self.running:
-                        break
+                while remaining_credentials and self.running:
+                    # Take a batch of credentials (size = max_workers)
+                    batch_size = min(self.max_workers, len(remaining_credentials))
+                    current_batch = remaining_credentials[:batch_size]
+                    remaining_credentials = remaining_credentials[batch_size:]
                     
-                    # Check for completed futures without blocking
-                    done_futures = []
-                    for future in list(future_to_credential.keys()):
-                        if future.done():
-                            done_futures.append(future)
+                    batch_count += 1
+                    self.progress_updated.emit(f"Processing batch {batch_count} of {batch_size} credentials...")
                     
-                    # Process all completed futures immediately
-                    for future in done_futures:
-                        try:
-                            result, result_type = future.result(timeout=0.1)  # Non-blocking
-                            email, line_num = future_to_credential[future]
-                            
-                            # Update counters based on result type
-                            if result_type == "SUCCESS":
-                                successful += 1
-                            elif result_type == "BANNED":
-                                banned += 1
-                            else:  # FAILED
-                                failed += 1
-                            
-                            # Write result immediately to file (write everything except login failures)
-                            if not result.startswith("LOGIN_FAILED"):
-                                self._write_result_to_file(result)
-                            
-                            # Calculate progress
-                            current_total = successful + failed + banned
-                            progress_percent = int((current_total / total_credentials) * 100)
-                            
-                            # Update progress and statistics immediately
-                            # Emit the actual result message first (for parsing)
-                            self.progress_updated.emit(result)
-                            
-                            # Then emit the progress message (but not for login failures to avoid duplicates)
-                            if not result.startswith("LOGIN_FAILED"):
-                                progress = f"Processed: {current_total}/{total_credentials} - {result}"
-                                self.progress_updated.emit(progress)
-                            
-                            self.progress_percentage.emit(progress_percent)
-                            
-                            # Calculate and update statistics immediately
-                            elapsed_time = time.time() - self.start_time
-                            rate = current_total / elapsed_time if elapsed_time > 0 else 0
-                            self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                            
-                            # Update status immediately
-                            self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
-                            
-                            # Remove from tracking
-                            del future_to_credential[future]
-                            
-                        except Exception as e:
+                    # Process current batch and wait for completion
+                    batch_results = self._process_batch(current_batch)
+                    
+                    # Update statistics
+                    for result_type in batch_results:
+                        if result_type == "SUCCESS":
+                            successful += 1
+                        elif result_type == "BANNED":
+                            banned += 1
+                        else:  # FAILED
                             failed += 1
-                            email, line_num = future_to_credential[future]
-                            result = f"ERROR: Line {line_num} - {email} - {str(e)}"
-                            self._write_result_to_file(result)
-                            
-                            # Emit the actual result message first (for parsing)
-                            self.progress_updated.emit(result)
-                            
-                            # Update statistics
-                            current_total = successful + failed + banned
-                            elapsed_time = time.time() - self.start_time
-                            rate = current_total / elapsed_time if elapsed_time > 0 else 0
-                            self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                            
-                            # Remove from tracking
-                            del future_to_credential[future]
                     
-                    # Small sleep to prevent busy waiting (much smaller than before)
-                    if not done_futures:
-                        time.sleep(0.001)  # 1ms instead of blocking
+                    # Calculate progress
+                    current_total = successful + failed + banned
+                    progress_percent = int((current_total / total_credentials) * 100)
+                    
+                    # Update progress and statistics
+                    self.progress_percentage.emit(progress_percent)
+                    elapsed_time = time.time() - self.start_time
+                    rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                    self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                    
+                    # Rotate IP if there are more credentials to process
+                    if remaining_credentials and self.running:
+                        self.progress_updated.emit("Batch completed. Rotating IP...")
+                        start_rotation = time.time()
+                        
+                        if self.vpn_manager.rotate_ip():
+                            rotation_time = time.time() - start_rotation
+                            self.progress_updated.emit(f"IP rotation completed in {rotation_time:.1f}s")
+                        else:
+                            self.progress_updated.emit("IP rotation failed, continuing with current IP")
+            else:
+                # Normal mode: Process all credentials continuously without waiting
+                self.progress_updated.emit("Starting continuous processing (normal mode)...")
+                
+                # Use ThreadPoolExecutor for continuous processing
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    # Submit all tasks to the thread pool
+                    future_to_credential = {}
+                    for email, password, line_num in credentials:
+                        if not self.running:
+                            break
+                        
+                        future = executor.submit(self._process_single_credential, email, password, line_num)
+                        future_to_credential[future] = (email, line_num)
+                    
+                    # Process completed tasks immediately as they finish (non-blocking)
+                    while future_to_credential and self.running:
+                        # Check for completed futures without blocking
+                        done_futures = []
+                        for future in list(future_to_credential.keys()):
+                            if future.done():
+                                done_futures.append(future)
+                        
+                        # Process all completed futures immediately
+                        for future in done_futures:
+                            try:
+                                result, result_type = future.result(timeout=0.1)  # Non-blocking
+                                email, line_num = future_to_credential[future]
+                                
+                                # Write result immediately to file (write everything except login failures)
+                                if not result.startswith("LOGIN_FAILED"):
+                                    self._write_result_to_file(result)
+                                
+                                # Emit the actual result message first (for parsing)
+                                self.progress_updated.emit(result)
+                                
+                                # Update statistics
+                                if result_type == "SUCCESS":
+                                    successful += 1
+                                elif result_type == "BANNED":
+                                    banned += 1
+                                else:  # FAILED
+                                    failed += 1
+                                
+                                # Calculate progress
+                                current_total = successful + failed + banned
+                                progress_percent = int((current_total / total_credentials) * 100)
+                                
+                                # Update progress and statistics
+                                self.progress_percentage.emit(progress_percent)
+                                elapsed_time = time.time() - self.start_time
+                                rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                                self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                                self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                                
+                                # Remove from tracking
+                                del future_to_credential[future]
+                                
+                            except Exception as e:
+                                email, line_num = future_to_credential[future]
+                                result = f"ERROR: Line {line_num} - {email} - {str(e)}"
+                                self._write_result_to_file(result)
+                                self.progress_updated.emit(result)
+                                
+                                failed += 1
+                                current_total = successful + failed + banned
+                                progress_percent = int((current_total / total_credentials) * 100)
+                                self.progress_percentage.emit(progress_percent)
+                                elapsed_time = time.time() - self.start_time
+                                rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                                self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                                self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                                
+                                # Remove from tracking
+                                del future_to_credential[future]
+                        
+                        # Small sleep to prevent busy waiting
+                        if not done_futures:
+                            time.sleep(0.001)  # 1ms instead of blocking
+            
+            # Disconnect VPN if enabled
+            if self.use_vpn and self.vpn_manager:
+                try:
+                    self.vpn_manager.disconnect()
+                except Exception as e:
+                    self.progress_updated.emit(f"VPN disconnect error: {e}")
             
             end_time = time.time()
             total_time = end_time - self.start_time
@@ -168,13 +245,81 @@ class BatchProcessorThread(QThread):
         except Exception as e:
             self.status_updated.emit(f"Error: {str(e)}")
     
+    def _process_batch(self, batch_credentials):
+        """Process a batch of credentials using ThreadPoolExecutor."""
+        results = []
+        
+        # Use ThreadPoolExecutor for true parallel processing
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks to the thread pool
+            future_to_credential = {}
+            for email, password, line_num in batch_credentials:
+                if not self.running:
+                    break
+                
+                future = executor.submit(self._process_single_credential, email, password, line_num)
+                future_to_credential[future] = (email, line_num)
+            
+            # Process completed tasks immediately as they finish (non-blocking)
+            while future_to_credential:
+                if not self.running:
+                    break
+                
+                # Check for completed futures without blocking
+                done_futures = []
+                for future in list(future_to_credential.keys()):
+                    if future.done():
+                        done_futures.append(future)
+                
+                # Process all completed futures immediately
+                for future in done_futures:
+                    try:
+                        result, result_type = future.result(timeout=0.1)  # Non-blocking
+                        email, line_num = future_to_credential[future]
+                        
+                        # Write result immediately to file (write everything except login failures)
+                        if not result.startswith("LOGIN_FAILED"):
+                            self._write_result_to_file(result)
+                        
+                        # Emit the actual result message first (for parsing)
+                        self.progress_updated.emit(result)
+                        
+                        # Then emit the progress message (but not for login failures to avoid duplicates)
+                        if not result.startswith("LOGIN_FAILED"):
+                            progress = f"Processed: {email} - {result}"
+                            self.progress_updated.emit(progress)
+                        
+                        results.append(result_type)
+                        
+                        # Remove from tracking
+                        del future_to_credential[future]
+                        
+                    except Exception as e:
+                        email, line_num = future_to_credential[future]
+                        result = f"ERROR: Line {line_num} - {email} - {str(e)}"
+                        self._write_result_to_file(result)
+                        
+                        # Emit the actual result message first (for parsing)
+                        self.progress_updated.emit(result)
+                        
+                        results.append("FAILED")
+                        
+                        # Remove from tracking
+                        del future_to_credential[future]
+                
+                # Small sleep to prevent busy waiting
+                if not done_futures:
+                    time.sleep(0.001)  # 1ms instead of blocking
+        
+        return results
+    
     def _process_single_credential(self, email: str, password: str, line_num: int):
         """Process a single credential - this runs in a separate thread."""
         try:
-            # Create client with scaled connection pool
-            client = EndesaClient(email, password, self.max_workers)
+            # Create client with scaled connection pool and retry configuration
+            client = EndesaClient(email, password, self.max_workers, self.max_retries, self.retry_delay)
             
-            # Step 1: Try to login first
+            # Step 1: Try to login first with retry mechanism
             try:
                 client.login()
                 login_successful = True
@@ -182,9 +327,9 @@ class BatchProcessorThread(QThread):
                 login_successful = False
                 error_msg = str(login_error)
                 
-                # Check for banned accounts
+                # Check for banned accounts (after all retries failed)
                 if "BANNED:" in error_msg:
-                    result = f"BANNED: Line {line_num} - {email} - {error_msg}"
+                    result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                     return result, "BANNED"
                 # Check for specific login failures - don't write these to file
                 elif "invalid username" in error_msg.lower() or "usuario o la contraseña son incorrectos" in error_msg.lower():
@@ -205,9 +350,9 @@ class BatchProcessorThread(QThread):
                     
                 except Exception as data_error:
                     error_msg = str(data_error)
-                    # Check for banned accounts during data retrieval
+                    # Check for banned accounts during data retrieval (after all retries failed)
                     if "BANNED:" in error_msg:
-                        result = f"BANNED: Line {line_num} - {email} - {error_msg}"
+                        result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                         return result, "BANNED"
                     else:
                         result = f"ERROR: Line {line_num} - {email} - Data retrieval failed: {error_msg}"
@@ -269,7 +414,7 @@ class EndesaInterface(QMainWindow):
                 border-radius: 8px;
                 margin-top: 1ex;
                 padding-top: 10px;
-                background-color: #2d2d2d;
+                background-color: transparent;
                 color: #ffffff;
             }
             QGroupBox::title {
@@ -301,7 +446,7 @@ class EndesaInterface(QMainWindow):
                 padding: 8px;
                 border: 2px solid #404040;
                 border-radius: 6px;
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
                 font-size: 14px;
             }
@@ -319,7 +464,7 @@ class EndesaInterface(QMainWindow):
             QTextEdit {
                 border: 2px solid #404040;
                 border-radius: 6px;
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
                 font-family: 'Consolas', 'Monaco', monospace;
                 font-size: 11px;
@@ -332,7 +477,7 @@ class EndesaInterface(QMainWindow):
                 border: 2px solid #404040;
                 border-radius: 6px;
                 text-align: center;
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
                 font-weight: bold;
                 height: 25px;
@@ -349,7 +494,7 @@ class EndesaInterface(QMainWindow):
                 padding: 8px;
                 border: 2px solid #404040;
                 border-radius: 6px;
-                background-color: #2d2d2d;
+                background-color: #1e1e1e;
                 color: #ffffff;
                 font-size: 14px;
             }
@@ -378,17 +523,15 @@ class EndesaInterface(QMainWindow):
         title_label.setStyleSheet("color: #00b4d8; margin-bottom: 10px; font-size: 24px;")
         layout.addWidget(title_label)
         
-        # Configuration group
-        config_group = QGroupBox("Configuration")
+        # Configuration group - Clean and simple
+        config_group = QGroupBox("⚙️ Configuration")
         config_group.setStyleSheet("""
             QGroupBox {
-                font-weight: bold;
-                border: 2px solid #404040;
+                border: 1px solid #404040;
                 border-radius: 8px;
                 margin-top: 1ex;
-                padding-top: 10px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                padding-top: 15px;
+                background-color: transparent;
                 color: #ffffff;
             }
             QGroupBox::title {
@@ -400,211 +543,237 @@ class EndesaInterface(QMainWindow):
                 font-weight: bold;
             }
         """)
-        config_layout = QVBoxLayout(config_group)
-        config_layout.setSpacing(12)
-        config_layout.setContentsMargins(15, 15, 15, 15)
+        config_layout = QGridLayout(config_group)
+        config_layout.setSpacing(15)
+        config_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Credentials file selection section
-        file_section = QWidget()
-        file_section.setStyleSheet("""
-            QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #3a3a3a, stop:1 #2a2a2a);
-                border: 1px solid #505050;
-                border-radius: 6px;
-                padding: 10px;
-            }
-        """)
-        file_layout = QHBoxLayout(file_section)
-        file_layout.setSpacing(10)
-        file_layout.setContentsMargins(10, 10, 10, 10)
+        # Credentials file selection - Row 0
+        self.credentials_label = QLabel("📁 Credentials File:")
+        self.credentials_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
         
-        # File icon and label
-        file_header = QWidget()
-        file_header_layout = QVBoxLayout(file_header)
-        file_header_layout.setSpacing(2)
-        file_header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.credentials_label = QLabel("📁 Credentials File")
-        self.credentials_label.setStyleSheet("""
-            color: #00b4d8; 
-            font-size: 13px; 
-            font-weight: bold;
-            margin-bottom: 2px;
-        """)
-        
-        file_desc = QLabel("Select the file containing email:password credentials")
-        file_desc.setStyleSheet("color: #888888; font-size: 10px; font-style: italic;")
-        
-        file_header_layout.addWidget(self.credentials_label)
-        file_header_layout.addWidget(file_desc)
-        
-        # File path display
         self.credentials_path_label = QLabel("No file selected")
         self.credentials_path_label.setStyleSheet("""
             color: #888888; 
             font-style: italic; 
             padding: 8px 12px; 
-            border: 2px solid #505050; 
-            border-radius: 6px; 
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                stop:0 #2d2d2d, stop:1 #1e1e1e);
+            border: 1px solid #505050; 
+            border-radius: 4px; 
+            background-color: #1e1e1e;
             font-size: 11px;
-            min-height: 35px;
         """)
-        self.credentials_path_label.setMinimumHeight(35)
         
-        # Browse button
-        self.browse_button = QPushButton("🔍 Browse")
+        self.browse_button = QPushButton("Browse")
         self.browse_button.setMinimumWidth(80)
-        self.browse_button.setMinimumHeight(35)
+        self.browse_button.setMinimumHeight(32)
+        self.browse_button.clicked.connect(self.browse_credentials_directory)
         self.browse_button.setStyleSheet("""
             QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #00b4d8, stop:1 #0096c7);
+                background-color: #00b4d8;
                 color: white;
                 border: none;
                 padding: 8px 15px;
-                border-radius: 6px;
+                border-radius: 4px;
                 font-weight: bold;
                 font-size: 11px;
             }
             QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #0096c7, stop:1 #0077b6);
+                background-color: #0096c7;
             }
             QPushButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #0077b6, stop:1 #005a8b);
+                background-color: #0077b6;
             }
         """)
-        self.browse_button.clicked.connect(self.browse_credentials_directory)
         
-        file_layout.addWidget(file_header)
-        file_layout.addWidget(self.credentials_path_label, 1)  # Stretch to fill space
-        file_layout.addWidget(self.browse_button)
+        config_layout.addWidget(self.credentials_label, 0, 0)
+        config_layout.addWidget(self.credentials_path_label, 0, 1)
+        config_layout.addWidget(self.browse_button, 0, 2)
         
-        config_layout.addWidget(file_section)
+        # Thread count selection - Row 1
+        self.threads_label = QLabel("⚡ Thread Count:")
+        self.threads_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
         
-        # Thread count selection section
-        thread_section = QWidget()
-        thread_section.setStyleSheet("""
-            QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #3a3a3a, stop:1 #2a2a2a);
-                border: 1px solid #505050;
-                border-radius: 6px;
-                padding: 10px;
-            }
-        """)
-        thread_layout = QHBoxLayout(thread_section)
-        thread_layout.setSpacing(10)
-        thread_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # Thread header
-        thread_header = QWidget()
-        thread_header_layout = QVBoxLayout(thread_header)
-        thread_header_layout.setSpacing(2)
-        thread_header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.threads_label = QLabel("⚡ Thread Count")
-        self.threads_label.setStyleSheet("""
-            color: #00b4d8; 
-            font-size: 13px; 
-            font-weight: bold;
-            margin-bottom: 2px;
-        """)
-        
-        thread_desc = QLabel("Number of parallel processing threads")
-        thread_desc.setStyleSheet("color: #888888; font-size: 10px; font-style: italic;")
-        
-        thread_header_layout.addWidget(self.threads_label)
-        thread_header_layout.addWidget(thread_desc)
-        
-        # Thread spinbox with modern styling
         self.threads_spinbox = QSpinBox()
         self.threads_spinbox.setRange(1, 200)
         self.threads_spinbox.setValue(50)
-        self.threads_spinbox.setMinimumWidth(120)
-        self.threads_spinbox.setMinimumHeight(35)
+        self.threads_spinbox.setMinimumWidth(100)
+        self.threads_spinbox.setMinimumHeight(32)
         self.threads_spinbox.setStyleSheet("""
             QSpinBox {
-                padding: 8px 12px;
-                border: 2px solid #505050;
-                border-radius: 6px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #2d2d2d, stop:1 #1e1e1e);
+                padding: 6px 10px;
+                border: 1px solid #505050;
+                border-radius: 4px;
+                background-color: #1e1e1e;
                 color: #ffffff;
                 font-size: 11px;
-                font-weight: bold;
             }
             QSpinBox:focus {
-                border: 2px solid #00b4d8;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #3a3a3a, stop:1 #2a2a2a);
+                border: 1px solid #00b4d8;
             }
             QSpinBox::up-button, QSpinBox::down-button {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #505050, stop:1 #404040);
+                background-color: #404040;
                 border: none;
-                border-radius: 3px;
-                width: 20px;
-                height: 15px;
-                margin: 2px;
+                border-radius: 2px;
+                width: 16px;
+                height: 12px;
+                margin: 1px;
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #00b4d8, stop:1 #0096c7);
-            }
-            QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #0077b6, stop:1 #005a8b);
-            }
-            QSpinBox::up-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-bottom: 4px solid #ffffff;
-                margin-top: 2px;
-            }
-            QSpinBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 4px solid #ffffff;
-                margin-bottom: 2px;
+                background-color: #00b4d8;
             }
         """)
         
-        # Thread info panel
-        thread_info_panel = QWidget()
-        thread_info_panel.setStyleSheet("""
-            QWidget {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #2a2a2a, stop:1 #1e1e1e);
-                border: 1px solid #404040;
+        config_layout.addWidget(self.threads_label, 1, 0)
+        config_layout.addWidget(self.threads_spinbox, 1, 1)
+        
+        # Retry configuration - Row 2
+        self.retry_label = QLabel("🔄 Retry Settings:")
+        self.retry_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        
+        retry_container = QWidget()
+        retry_layout = QHBoxLayout(retry_container)
+        retry_layout.setSpacing(15)
+        retry_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Max retries
+        retry_attempts_label = QLabel("Max Retries:")
+        retry_attempts_label.setStyleSheet("color: #888888; font-size: 11px;")
+        
+        self.retry_attempts_spinbox = QSpinBox()
+        self.retry_attempts_spinbox.setRange(1, 10)
+        self.retry_attempts_spinbox.setValue(3)
+        self.retry_attempts_spinbox.setMinimumWidth(80)
+        self.retry_attempts_spinbox.setMinimumHeight(32)
+        self.retry_attempts_spinbox.setStyleSheet("""
+            QSpinBox {
+                padding: 6px 10px;
+                border: 1px solid #505050;
                 border-radius: 4px;
-                padding: 6px;
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-size: 11px;
+            }
+            QSpinBox:focus {
+                border: 1px solid #00b4d8;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #404040;
+                border: none;
+                border-radius: 2px;
+                width: 16px;
+                height: 12px;
+                margin: 1px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #00b4d8;
             }
         """)
-        thread_info_layout = QVBoxLayout(thread_info_panel)
-        thread_info_layout.setSpacing(2)
-        thread_info_layout.setContentsMargins(6, 6, 6, 6)
         
-        thread_info_title = QLabel("💡 Performance Tips")
-        thread_info_title.setStyleSheet("color: #00b4d8; font-size: 10px; font-weight: bold;")
+        # Base delay
+        retry_delay_label = QLabel("Base Delay (s):")
+        retry_delay_label.setStyleSheet("color: #888888; font-size: 11px;")
         
-        thread_info_label = QLabel("• 10-50: Safe\n• 50-100: High perf\n• 100+: Max speed")
-        thread_info_label.setStyleSheet("color: #888888; font-size: 9px; line-height: 1.2;")
+        self.retry_delay_spinbox = QSpinBox()
+        self.retry_delay_spinbox.setRange(1, 30)
+        self.retry_delay_spinbox.setValue(2)
+        self.retry_delay_spinbox.setMinimumWidth(80)
+        self.retry_delay_spinbox.setMinimumHeight(32)
+        self.retry_delay_spinbox.setStyleSheet("""
+            QSpinBox {
+                padding: 6px 10px;
+                border: 1px solid #505050;
+                border-radius: 4px;
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-size: 11px;
+            }
+            QSpinBox:focus {
+                border: 1px solid #00b4d8;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #404040;
+                border: none;
+                border-radius: 2px;
+                width: 16px;
+                height: 12px;
+                margin: 1px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #00b4d8;
+            }
+        """)
         
-        thread_info_layout.addWidget(thread_info_title)
-        thread_info_layout.addWidget(thread_info_label)
+        retry_layout.addWidget(retry_attempts_label)
+        retry_layout.addWidget(self.retry_attempts_spinbox)
+        retry_layout.addWidget(retry_delay_label)
+        retry_layout.addWidget(self.retry_delay_spinbox)
+        retry_layout.addStretch()
         
-        thread_layout.addWidget(thread_header)
-        thread_layout.addWidget(self.threads_spinbox)
-        thread_layout.addWidget(thread_info_panel)
+        config_layout.addWidget(self.retry_label, 2, 0)
+        config_layout.addWidget(retry_container, 2, 1, 1, 2)
         
-        config_layout.addWidget(thread_section)
+        # VPN checkbox - Row 3
+        self.vpn_label = QLabel("🌐 VPN:")
+        self.vpn_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        
+        # Create a container for VPN with better visual feedback
+        vpn_container = QWidget()
+        vpn_layout = QHBoxLayout(vpn_container)
+        vpn_layout.setSpacing(10)
+        vpn_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.vpn_checkbox = QCheckBox("Enable IP rotation between batches")
+        self.vpn_checkbox.setChecked(False)
+        self.vpn_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #ffffff;
+                font-size: 11px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border: 2px solid #505050;
+                border-radius: 5px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00b4d8;
+                border: 2px solid #00b4d8;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #1e1e1e;
+                border: 2px solid #505050;
+            }
+            QCheckBox::indicator:hover {
+                background-color: #404040;
+                border: 2px solid #00b4d8;
+            }
+            QCheckBox:checked {
+                color: #00b4d8;
+                font-weight: bold;
+            }
+        """)
+        
+        # Add a status indicator label
+        self.vpn_status_indicator = QLabel("❌ Disabled")
+        self.vpn_status_indicator.setStyleSheet("""
+            color: #ff6b6b;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 4px 8px;
+            border: 1px solid #ff6b6b;
+            border-radius: 3px;
+            background-color: rgba(255, 107, 107, 0.1);
+        """)
+        
+        # Connect checkbox to update status indicator
+        self.vpn_checkbox.toggled.connect(self.update_vpn_status_indicator)
+        
+        vpn_layout.addWidget(self.vpn_checkbox)
+        vpn_layout.addWidget(self.vpn_status_indicator)
+        vpn_layout.addStretch()
+        
+        config_layout.addWidget(self.vpn_label, 3, 0)
+        config_layout.addWidget(vpn_container, 3, 1, 1, 2)
         
         layout.addWidget(config_group)
         
@@ -1017,6 +1186,9 @@ class EndesaInterface(QMainWindow):
         
         # Get configuration
         max_workers = self.threads_spinbox.value()
+        max_retries = self.retry_attempts_spinbox.value()
+        retry_delay = self.retry_delay_spinbox.value()
+        use_vpn = self.vpn_checkbox.isChecked()
         output_file = "results.txt"
         
         # Clear output
@@ -1025,14 +1197,21 @@ class EndesaInterface(QMainWindow):
         self.success_table.setRowCount(0)  # Clear success table
         self.success_data = []  # Clear success data
         self.output_text.append("Starting batch processing...\n")
+        self.output_text.append(f"Configuration: {max_workers} threads, {max_retries} retries, {retry_delay}s base delay")
+        if use_vpn:
+            self.output_text.append("VPN: Enabled (IP rotation after each batch)")
+        else:
+            self.output_text.append("VPN: Disabled")
+        self.output_text.append("")
         
-        # Create and start processor thread
-        self.processor_thread = BatchProcessorThread(credentials_file, max_workers, output_file)
+        # Create and start processor thread with retry configuration
+        self.processor_thread = BatchProcessorThread(credentials_file, max_workers, output_file, max_retries, retry_delay, use_vpn)
         self.processor_thread.progress_updated.connect(self.update_progress)
         self.processor_thread.status_updated.connect(self.update_status)
         self.processor_thread.stats_updated.connect(self.update_stats)
         self.processor_thread.progress_percentage.connect(self.update_progress_percentage)
         self.processor_thread.finished_processing.connect(self.processing_finished)
+        self.processor_thread.vpn_status_updated.connect(self.update_vpn_status)
         
         self.processor_thread.start()
         
@@ -1256,6 +1435,56 @@ class EndesaInterface(QMainWindow):
             f"Time: {total_time:.1f}s\n"
             f"Rate: {rate:.1f} req/s"
         )
+
+    def update_vpn_status_indicator(self, checked: bool):
+        """Update the VPN status indicator based on checkbox state."""
+        if checked:
+            self.vpn_status_indicator.setText("✅ Enabled")
+            self.vpn_status_indicator.setStyleSheet("""
+                color: #00ff00;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 4px 8px;
+                border: 1px solid #00ff00;
+                border-radius: 3px;
+                background-color: rgba(0, 255, 0, 0.1);
+            """)
+        else:
+            self.vpn_status_indicator.setText("❌ Disabled")
+            self.vpn_status_indicator.setStyleSheet("""
+                color: #ff6b6b;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 4px 8px;
+                border: 1px solid #ff6b6b;
+                border-radius: 3px;
+                background-color: rgba(255, 107, 107, 0.1);
+            """)
+
+    def update_vpn_status(self, message: str):
+        """Update VPN status messages."""
+        # Color VPN messages in blue
+        colored_message = f'<span style="color: #00b4d8;">{message}</span>'
+        
+        # Add to output lines list for management
+        self.output_lines.append(colored_message)
+        
+        # Keep only last max_output_lines for performance
+        if len(self.output_lines) > self.max_output_lines:
+            # Remove oldest lines
+            lines_to_remove = len(self.output_lines) - self.max_output_lines
+            self.output_lines = self.output_lines[lines_to_remove:]
+            
+            # Rebuild output text efficiently
+            self.output_text.clear()
+            self.output_text.append('\n'.join(self.output_lines))
+        else:
+            # Just append new line
+            self.output_text.append(colored_message)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.output_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 
 def main():

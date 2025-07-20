@@ -3,6 +3,7 @@
 
 import json
 import re
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -14,11 +15,13 @@ class EndesaClient:
     BASE_URL = "https://www.endesaclientes.com"
     AUTH_URL = "https://accounts.enel.com/samlsso"
     
-    def __init__(self, email: str, password: str, max_workers: int = 10):
+    def __init__(self, email: str, password: str, max_workers: int = 10, max_retries: int = 3, retry_delay: float = 2.0):
         self.email = email
         self.password = password
         self.session = requests.Session()
         self.session_id = None
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         
         # Optimize session for large datasets
         self.session.headers.update({
@@ -167,32 +170,59 @@ class EndesaClient:
         return response.json()
     
     def login(self):
-        """Authenticate with Endesa portal."""
-        session_key = self._get_session_key()
-        self._authenticate(session_key)
+        """Authenticate with Endesa portal with retry mechanism for bans."""
+        for attempt in range(self.max_retries):
+            try:
+                session_key = self._get_session_key()
+                self._authenticate(session_key)
+                return  # Success, exit retry loop
+            except Exception as e:
+                error_msg = str(e)
+                if "BANNED:" in error_msg:
+                    if attempt < self.max_retries - 1:  # Not the last attempt
+                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                        time.sleep(delay)
+                        continue  # Retry
+                    else:
+                        raise  # Last attempt failed, re-raise the exception
+                else:
+                    raise  # Non-ban error, don't retry
     
     def get_account_info(self) -> Dict[str, str]:
-        """Retrieve account information including IBAN and phone."""
+        """Retrieve account information including IBAN and phone with retry mechanism for bans."""
         if not self.session_id:
             raise Exception("Not authenticated")
         
-        user_data = self._get_user_info()
-        client_id, contract_number = self._extract_account_data(user_data)
-        contract_data = self._get_contract_info(client_id, contract_number)
-        
-        # Extract IBAN and phone
-        iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
-        phone = (
-            self._find_key(contract_data, "phone", "phonenumber") or
-            user_data.get("contactPerson", {}).get("phone")
-        )
-        
-        return {
-            "client_id": client_id,
-            "contract_number": contract_number,
-            "iban": iban,
-            "phone": phone
-        }
+        for attempt in range(self.max_retries):
+            try:
+                user_data = self._get_user_info()
+                client_id, contract_number = self._extract_account_data(user_data)
+                contract_data = self._get_contract_info(client_id, contract_number)
+                
+                # Extract IBAN and phone
+                iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
+                phone = (
+                    self._find_key(contract_data, "phone", "phonenumber") or
+                    user_data.get("contactPerson", {}).get("phone")
+                )
+                
+                return {
+                    "client_id": client_id,
+                    "contract_number": contract_number,
+                    "iban": iban,
+                    "phone": phone
+                }
+            except Exception as e:
+                error_msg = str(e)
+                if "BANNED:" in error_msg:
+                    if attempt < self.max_retries - 1:  # Not the last attempt
+                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                        time.sleep(delay)
+                        continue  # Retry
+                    else:
+                        raise  # Last attempt failed, re-raise the exception
+                else:
+                    raise  # Non-ban error, don't retry
     
     def close(self):
         """Close the session."""
