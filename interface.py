@@ -98,18 +98,34 @@ class BatchProcessorThread(QThread):
             
             # Process all credentials continuously without waiting for batch completion
             if self.use_vpn:
-                # VPN mode: Process in batches with IP rotation
+                # VPN mode: Process in batches with IP rotation and retry
                 remaining_credentials = credentials.copy()
+                retry_credentials = []  # Store credentials for retry (bans + timeouts)
                 batch_count = 0
+                max_retries = 3  # Maximum times to retry credentials
                 
-                while remaining_credentials and self.running:
-                    # Take a batch of credentials (size = max_workers)
-                    batch_size = min(self.max_workers, len(remaining_credentials))
-                    current_batch = remaining_credentials[:batch_size]
-                    remaining_credentials = remaining_credentials[batch_size:]
+                while (remaining_credentials or retry_credentials) and self.running:
+                    # Prepare current batch: remaining + retry credentials
+                    current_batch = []
+                    
+                    # Add remaining credentials first
+                    if remaining_credentials:
+                        batch_size = min(self.max_workers, len(remaining_credentials))
+                        current_batch.extend(remaining_credentials[:batch_size])
+                        remaining_credentials = remaining_credentials[batch_size:]
+                    
+                    # Add retry credentials if we have space
+                    if retry_credentials and len(current_batch) < self.max_workers:
+                        space_left = self.max_workers - len(current_batch)
+                        retry_to_process = retry_credentials[:space_left]
+                        current_batch.extend(retry_to_process)
+                        retry_credentials = retry_credentials[space_left:]
+                    
+                    if not current_batch:
+                        break
                     
                     batch_count += 1
-                    self.progress_updated.emit(f"Processing batch {batch_count} of {batch_size} credentials...")
+                    self.progress_updated.emit(f"Processing batch {batch_count} of {len(current_batch)} credentials...")
                     
                     # Rotate IP if not the first batch
                     if batch_count > 1:
@@ -120,7 +136,7 @@ class BatchProcessorThread(QThread):
                             self.progress_updated.emit("IP rotation failed, continuing with current IP")
                     
                     # Process current batch and wait for completion (VPN mode)
-                    batch_results = self._process_batch(current_batch)
+                    batch_results = self._process_batch_with_retry_tracking(current_batch, retry_credentials, max_retries)
                     
                     # Update statistics
                     for result_type in batch_results:
@@ -144,7 +160,7 @@ class BatchProcessorThread(QThread):
                     elapsed_time = time.time() - self.start_time
                     rate = current_total / elapsed_time if elapsed_time > 0 else 0
                     self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%) - Retry queue: {len(retry_credentials)}")
             else:
                 # Normal mode: Process all credentials continuously without waiting
                 self.progress_updated.emit("Starting continuous processing (normal mode)...")
@@ -245,7 +261,7 @@ class BatchProcessorThread(QThread):
             self.status_updated.emit(f"Error: {str(e)}")
     
     def _process_batch(self, batch_credentials):
-        """Process a batch of credentials using ThreadPoolExecutor."""
+        """Process a batch of credentials using ThreadPoolExecutor (for non-VPN mode)."""
         results = []
         
         # Use ThreadPoolExecutor for true parallel processing
@@ -297,6 +313,93 @@ class BatchProcessorThread(QThread):
                         email, line_num = future_to_credential[future]
                         result = f"ERROR: Line {line_num} - {email} - {str(e)}"
                         self._write_result_to_file(result)
+                        self.progress_updated.emit(result)
+                        
+                        results.append("FAILED")
+                        
+                        # Remove from tracking
+                        del future_to_credential[future]
+                
+                # Small sleep to prevent busy waiting
+                if not done_futures:
+                    time.sleep(0.001)  # 1ms instead of blocking
+        
+        return results
+    
+    def _process_batch_with_retry_tracking(self, batch_credentials, retry_credentials, max_retries):
+        """Process a batch of credentials with retry tracking for bans and timeouts."""
+        results = []
+        retry_count = {}  # Track retry count for each credential
+        
+        # Use ThreadPoolExecutor for true parallel processing
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks to the thread pool
+            future_to_credential = {}
+            for email, password, line_num in batch_credentials:
+                if not self.running:
+                    break
+                
+                future = executor.submit(self._process_single_credential, email, password, line_num)
+                future_to_credential[future] = (email, password, line_num)
+            
+            # Process completed tasks immediately as they finish (non-blocking)
+            while future_to_credential:
+                if not self.running:
+                    break
+                
+                # Check for completed futures without blocking
+                done_futures = []
+                for future in list(future_to_credential.keys()):
+                    if future.done():
+                        done_futures.append(future)
+                
+                # Process all completed futures immediately
+                for future in done_futures:
+                    try:
+                        result, result_type = future.result(timeout=0.1)  # Non-blocking
+                        email, password, line_num = future_to_credential[future]
+                        
+                        # Handle retry logic for bans and timeouts
+                        if result_type in ["BANNED", "TIMEOUT"]:
+                            # Check if we should retry this credential
+                            current_retry_count = retry_count.get((email, line_num), 0)
+                            if current_retry_count < max_retries:
+                                # Add to retry credentials for next batch
+                                retry_credentials.append((email, password, line_num))
+                                retry_count[(email, line_num)] = current_retry_count + 1
+                                retry_type = "BANNED" if result_type == "BANNED" else "TIMEOUT"
+                                self.progress_updated.emit(f"{retry_type}: Line {line_num} - {email} - Will retry in next batch (attempt {current_retry_count + 1}/{max_retries})")
+                                result_type = "RETRY"  # Don't count as banned/timeout yet
+                            else:
+                                # Max retries reached, count as permanently failed
+                                retry_type = "BANNED" if result_type == "BANNED" else "TIMEOUT"
+                                self.progress_updated.emit(f"{retry_type}: Line {line_num} - {email} - Max retries reached ({max_retries}), giving up")
+                                # Count as banned if it was a ban, otherwise as failed
+                                result_type = "BANNED" if result_type == "BANNED" else "FAILED"
+                        
+                        # Write result immediately to file (only write SUCCESS and NO_DATA)
+                        if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
+                            self._write_result_to_file(result)
+                        
+                        # Emit the actual result message first (for parsing)
+                        self.progress_updated.emit(result)
+                        
+                        # Then emit the progress message (but not for login failures to avoid duplicates)
+                        if not result.startswith("LOGIN_FAILED"):
+                            progress = f"Processed: {email} - {result}"
+                            self.progress_updated.emit(progress)
+                        
+                        # Only add to results if not a retry
+                        if result_type != "RETRY":
+                            results.append(result_type)
+                        
+                        # Remove from tracking
+                        del future_to_credential[future]
+                        
+                    except Exception as e:
+                        email, password, line_num = future_to_credential[future]
+                        result = f"ERROR: Line {line_num} - {email} - {str(e)}"
+                        self._write_result_to_file(result)
                         
                         # Emit the actual result message first (for parsing)
                         self.progress_updated.emit(result)
@@ -330,6 +433,10 @@ class BatchProcessorThread(QThread):
                 if "BANNED:" in error_msg:
                     result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                     return result, "BANNED"
+                # Check for timeout errors - these should be retried
+                elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    result = f"TIMEOUT: Line {line_num} - {email} - {error_msg}"
+                    return result, "TIMEOUT"  # Mark for retry
                 # Check for specific "Invalid URL '/sites/Satellite'" error - this is the only one we count as invalid
                 elif "invalid url '/sites/satellite'" in error_msg.lower():
                     result = f"INVALID: Line {line_num} - {email} - Invalid URL Satellite"
