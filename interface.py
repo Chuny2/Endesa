@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, 
     QPushButton, QLabel, QSpinBox, QTextEdit, QProgressBar, 
     QGroupBox, QGridLayout, QFileDialog, QMessageBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSizePolicy
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSizePolicy, QLineEdit
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -31,7 +31,7 @@ class BatchProcessorThread(QThread):
     finished_processing = pyqtSignal(int, int, float)
     vpn_status_updated = pyqtSignal(str)  # VPN status updates
     
-    def __init__(self, credentials_file: str, max_workers: int, output_file: str, max_retries: int = 3, retry_delay: float = 2.0, use_vpn: bool = False):
+    def __init__(self, credentials_file: str, max_workers: int, output_file: str, max_retries: int = 3, retry_delay: float = 2.0, use_vpn: bool = False, proxy: Optional[str] = None, proxy_list: Optional[list] = None):
         super().__init__()
         self.credentials_file = credentials_file
         self.max_workers = max_workers
@@ -39,6 +39,8 @@ class BatchProcessorThread(QThread):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.use_vpn = use_vpn
+        self.proxy = proxy
+        self.proxy_list = proxy_list or []
         self.vpn_manager = None
         self.running = True
         self.start_time = None
@@ -419,7 +421,7 @@ class BatchProcessorThread(QThread):
         """Process a single credential - this runs in a separate thread."""
         try:
             # Create client with scaled connection pool and retry configuration
-            client = EndesaClient(email, password, self.max_workers, self.max_retries, self.retry_delay)
+            client = EndesaClient(email, password, self.max_workers, self.max_retries, self.retry_delay, self.proxy, self.proxy_list)
             
             # Step 1: Try to login first with retry mechanism
             try:
@@ -906,6 +908,167 @@ class EndesaInterface(QMainWindow):
         config_layout.addWidget(self.vpn_label, 3, 0)
         config_layout.addWidget(vpn_container, 3, 1, 1, 2)
         
+        # Proxy configuration - Row 4
+        self.proxy_label = QLabel("🔗 Proxy:")
+        self.proxy_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold; padding: 8px 0px;")
+        
+        # Create a container for proxy settings
+        proxy_container = QWidget()
+        proxy_layout = QHBoxLayout(proxy_container)
+        proxy_layout.setSpacing(10)
+        proxy_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.proxy_checkbox = QCheckBox("Use proxy")
+        self.proxy_checkbox.setChecked(False)
+        self.proxy_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #ffffff;
+                font-size: 11px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #505050;
+                border-radius: 4px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00b4d8;
+                border: 2px solid #00b4d8;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #1e1e1e;
+                border: 2px solid #505050;
+            }
+            QCheckBox::indicator:hover {
+                background-color: #404040;
+                border: 2px solid #00b4d8;
+            }
+            QCheckBox:checked {
+                color: #00b4d8;
+                font-weight: bold;
+            }
+        """)
+        
+        # Proxy configuration container
+        proxy_input_container = QWidget()
+        proxy_input_layout = QVBoxLayout(proxy_input_container)
+        proxy_input_layout.setSpacing(5)
+        proxy_input_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Proxy URL input
+        self.proxy_url_input = QLineEdit()
+        self.proxy_url_input.setPlaceholderText("IP:PORT:USER__DOMAIN:PASS or http://user:pass@host:port")
+        self.proxy_url_input.setEnabled(False)
+        self.proxy_url_input.setMinimumWidth(200)
+        self.proxy_url_input.setMinimumHeight(30)
+        self.proxy_url_input.setStyleSheet("""
+            QLineEdit {
+                padding: 8px 12px;
+                border: 1px solid #505050;
+                border-radius: 4px;
+                background-color: #1e1e1e;
+                color: #ffffff;
+                font-size: 11px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #00b4d8;
+            }
+            QLineEdit:disabled {
+                background-color: #2a2a2a;
+                color: #666666;
+                border: 1px solid #404040;
+            }
+        """)
+        
+        # Proxy list option
+        self.proxy_list_checkbox = QCheckBox("Use proxy list file")
+        self.proxy_list_checkbox.setEnabled(False)
+        self.proxy_list_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #ffffff;
+                font-size: 10px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #505050;
+                border-radius: 3px;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00b4d8;
+                border: 2px solid #00b4d8;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #1e1e1e;
+                border: 2px solid #505050;
+            }
+            QCheckBox:disabled {
+                color: #666666;
+            }
+        """)
+        
+        # Proxy list file selection
+        self.proxy_list_path_label = QLabel("No proxy list file selected")
+        self.proxy_list_path_label.setEnabled(False)
+        self.proxy_list_path_label.setStyleSheet("""
+            color: #888888; 
+            font-style: italic; 
+            padding: 4px 6px; 
+            border: 1px solid #505050; 
+            border-radius: 3px; 
+            background-color: transparent;
+            font-size: 9px;
+        """)
+        
+        self.browse_proxy_list_button = QPushButton("Browse")
+        self.browse_proxy_list_button.setEnabled(False)
+        self.browse_proxy_list_button.setMinimumWidth(60)
+        self.browse_proxy_list_button.setMinimumHeight(25)
+        self.browse_proxy_list_button.setStyleSheet("""
+            QPushButton {
+                background-color: #404040;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 9px;
+            }
+            QPushButton:hover {
+                background-color: #00b4d8;
+            }
+            QPushButton:disabled {
+                background-color: #2a2a2a;
+                color: #666666;
+            }
+        """)
+        self.browse_proxy_list_button.clicked.connect(self.browse_proxy_list_file)
+        
+        # Add proxy list controls to layout
+        proxy_list_container = QWidget()
+        proxy_list_layout = QHBoxLayout(proxy_list_container)
+        proxy_list_layout.setSpacing(5)
+        proxy_list_layout.setContentsMargins(0, 0, 0, 0)
+        proxy_list_layout.addWidget(self.proxy_list_path_label)
+        proxy_list_layout.addWidget(self.browse_proxy_list_button)
+        
+        proxy_input_layout.addWidget(self.proxy_url_input)
+        proxy_input_layout.addWidget(self.proxy_list_checkbox)
+        proxy_input_layout.addWidget(proxy_list_container)
+        
+        # Connect checkboxes with proper logic
+        self.proxy_checkbox.toggled.connect(self.update_proxy_controls)
+        self.proxy_list_checkbox.toggled.connect(self.update_proxy_controls)
+        
+        proxy_layout.addWidget(self.proxy_checkbox)
+        proxy_layout.addWidget(proxy_input_container)
+        proxy_layout.addStretch()
+        
+        config_layout.addWidget(self.proxy_label, 4, 0)
+        config_layout.addWidget(proxy_container, 4, 1, 1, 2)
+        
         left_layout.addWidget(config_group)
         
         # Control group
@@ -1327,6 +1490,53 @@ class EndesaInterface(QMainWindow):
                 min-height: 35px;
             """)
     
+    def browse_proxy_list_file(self):
+        """Browse for proxy list file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Select Proxy List File", 
+            "", 
+            "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if file_path:
+            self.proxy_list_path_label.setText(file_path)
+            self.proxy_list_path_label.setStyleSheet("""
+                color: #00b4d8; 
+                font-weight: bold; 
+                padding: 4px 6px; 
+                border: 1px solid #00b4d8; 
+                border-radius: 3px; 
+                background-color: transparent;
+                font-size: 9px;
+            """)
+    
+    def update_proxy_controls(self):
+        """Update proxy control states based on checkbox selections."""
+        use_proxy = self.proxy_checkbox.isChecked()
+        use_proxy_list = self.proxy_list_checkbox.isChecked()
+        
+        # Enable/disable proxy list checkbox based on main proxy checkbox
+        self.proxy_list_checkbox.setEnabled(use_proxy)
+        
+        if use_proxy:
+            if use_proxy_list:
+                # Proxy list mode: disable URL input, enable list controls
+                self.proxy_url_input.setEnabled(False)
+                self.proxy_list_path_label.setEnabled(True)
+                self.browse_proxy_list_button.setEnabled(True)
+            else:
+                # Single proxy mode: enable URL input, disable list controls
+                self.proxy_url_input.setEnabled(True)
+                self.proxy_list_path_label.setEnabled(False)
+                self.browse_proxy_list_button.setEnabled(False)
+        else:
+            # Proxy disabled: disable all controls
+            self.proxy_url_input.setEnabled(False)
+            self.proxy_list_checkbox.setEnabled(False)
+            self.proxy_list_path_label.setEnabled(False)
+            self.browse_proxy_list_button.setEnabled(False)
+    
     def start_processing(self):
         """Start the batch processing."""
         credentials_file = self.credentials_path_label.text()
@@ -1340,12 +1550,99 @@ class EndesaInterface(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a .txt file.")
             return
         
-        # Get configuration
+        # Get configuration first
         max_workers = self.threads_spinbox.value()
         max_retries = self.retry_attempts_spinbox.value()
         retry_delay = self.retry_delay_spinbox.value()
         use_vpn = self.vpn_checkbox.isChecked()
+        use_proxy = self.proxy_checkbox.isChecked()
+        use_proxy_list = self.proxy_list_checkbox.isChecked() if use_proxy else False
+        proxy_url = self.proxy_url_input.text().strip() if use_proxy and not use_proxy_list else None
+        proxy_list_file = self.proxy_list_path_label.text() if use_proxy_list else None
         output_file = "results.txt"
+        
+        # Validate proxy settings
+        if use_proxy and not use_proxy_list and not proxy_url:
+            QMessageBox.warning(self, "Error", "Please enter a proxy URL when proxy is enabled.")
+            return
+        
+        if use_proxy and use_proxy_list and proxy_list_file == "No proxy list file selected":
+            QMessageBox.warning(self, "Error", "Please select a proxy list file when proxy list is enabled.")
+            return
+        
+        if use_proxy and not use_proxy_list and proxy_url:
+            # Test if the proxy format can be parsed
+            try:
+                # Create a temporary client to test proxy parsing
+                from endesa import EndesaClient
+                test_client = EndesaClient("test@test.com", "test", proxy=proxy_url)
+                # If we get here, the proxy format is valid
+                del test_client
+            except Exception as e:
+                QMessageBox.warning(self, "Error", 
+                    f"Invalid proxy format:\n\n"
+                    f"• {proxy_url}\n\n"
+                    "Supported formats:\n"
+                    "• http://user:pass@host:port\n"
+                    "• http://host:port\n"
+                    "• IP:PORT:USERNAME:PASSWORD\n"
+                    "• IP:PORT:USERNAME__DOMAIN:PASSWORD\n"
+                    "• USERNAME:PASSWORD@IP:PORT\n\n"
+                    f"Error: {str(e)}")
+                return
+        
+        # Load proxy list if enabled
+        proxy_list = None
+        if use_proxy and use_proxy_list and proxy_list_file != "No proxy list file selected":
+            try:
+                with open(proxy_list_file, 'r', encoding='utf-8') as f:
+                    proxy_list = [line.strip() for line in f if line.strip()]
+                
+                if not proxy_list:
+                    QMessageBox.warning(self, "Error", "Proxy list file is empty.")
+                    return
+                
+                # Debug: Check for duplicate entries
+                unique_proxies = list(set(proxy_list))
+                if len(unique_proxies) != len(proxy_list):
+                    print(f"Warning: Found {len(proxy_list) - len(unique_proxies)} duplicate proxy entries")
+                    proxy_list = unique_proxies  # Remove duplicates
+                
+                # Validate proxy URLs in list using the parser
+                from endesa import EndesaClient
+                for i, proxy in enumerate(proxy_list):
+                    try:
+                        # Test if the proxy format can be parsed by creating a minimal client
+                        test_client = EndesaClient("test@test.com", "test", proxy=proxy)
+                        # Clean up immediately
+                        test_client.session.close()
+                        del test_client
+                    except Exception as e:
+                        QMessageBox.warning(self, "Error", 
+                            f"Invalid proxy format at line {i+1}:\n\n"
+                            f"• {proxy}\n\n"
+                            "Supported formats:\n"
+                            "• http://user:pass@host:port\n"
+                            "• http://host:port\n"
+                            "• IP:PORT:USERNAME:PASSWORD\n"
+                            "• IP:PORT:USERNAME__DOMAIN:PASSWORD\n"
+                            "• USERNAME:PASSWORD@IP:PORT\n\n"
+                            f"Error: {str(e)}")
+                        return
+                        
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to read proxy list file: {str(e)}")
+                return
+        
+        # Warn about VPN + Proxy combination
+        if use_vpn and use_proxy:
+            reply = QMessageBox.question(self, "Warning", 
+                "You have both VPN and Proxy enabled. This may cause conflicts.\n\n"
+                "VPN mode already provides IP rotation, so proxy may not be necessary.\n\n"
+                "Do you want to continue?", 
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
         
         # Clear output
         self.output_text.clear()
@@ -1358,10 +1655,25 @@ class EndesaInterface(QMainWindow):
             self.output_text.append("VPN: Enabled (IP rotation after each batch)")
         else:
             self.output_text.append("VPN: Disabled")
+        if use_proxy:
+            if use_proxy_list and proxy_list:
+                self.output_text.append(f"Proxy: Enabled (List with {len(proxy_list)} proxies)")
+            elif proxy_url:
+                self.output_text.append(f"Proxy: Enabled ({proxy_url})")
+        else:
+            self.output_text.append("Proxy: Disabled")
         self.output_text.append("")
         
         # Create and start processor thread with retry configuration
-        self.processor_thread = BatchProcessorThread(credentials_file, max_workers, output_file, max_retries, retry_delay, use_vpn)
+        # Pass None as proxy when using proxy list, and pass proxy_list separately
+        final_proxy = None if use_proxy_list and proxy_list else proxy_url
+        
+        # Debug: Print proxy configuration
+        if use_proxy_list and proxy_list:
+            print(f"Using proxy list with {len(proxy_list)} proxies")
+            print(f"First proxy: {proxy_list[0] if proxy_list else 'None'}")
+        
+        self.processor_thread = BatchProcessorThread(credentials_file, max_workers, output_file, max_retries, retry_delay, use_vpn, final_proxy, proxy_list)
         self.processor_thread.progress_updated.connect(self.update_progress)
         self.processor_thread.status_updated.connect(self.update_status)
         self.processor_thread.stats_updated.connect(self.update_stats)

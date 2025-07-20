@@ -4,7 +4,8 @@
 import json
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+import random
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
@@ -15,13 +16,26 @@ class EndesaClient:
     BASE_URL = "https://www.endesaclientes.com"
     AUTH_URL = "https://accounts.enel.com/samlsso"
     
-    def __init__(self, email: str, password: str, max_workers: int = 10, max_retries: int = 3, retry_delay: float = 2.0):
+    def __init__(self, email: str, password: str, max_workers: int = 10, max_retries: int = 3, retry_delay: float = 2.0, proxy: Optional[str] = None, proxy_list: Optional[List[str]] = None):
         self.email = email
         self.password = password
         self.session = requests.Session()
         self.session_id = None
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.proxy = proxy
+        self.proxy_list = proxy_list or []
+        self.current_proxy_index = 0
+        
+        # Configure proxy if provided
+        if proxy:
+            self._configure_proxy(proxy)
+        elif self.proxy_list:
+            # Ensure proxy_list contains strings, not lists
+            if self.proxy_list and isinstance(self.proxy_list[0], str):
+                self._configure_proxy(self.proxy_list[0])
+            else:
+                raise ValueError(f"Invalid proxy list format: {self.proxy_list}")
         
         # Optimize session for large datasets
         self.session.headers.update({
@@ -42,6 +56,144 @@ class EndesaClient:
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
+    
+    def _configure_proxy(self, proxy_url: str):
+        """Configure proxy for the session."""
+        try:
+            # Ensure proxy_url is a string, not a list
+            if isinstance(proxy_url, list):
+                raise ValueError(f"Expected proxy string, got list: {proxy_url}")
+            
+            # Parse and convert proxy format if needed
+            parsed_proxy = self._parse_proxy_format(proxy_url)
+            if not parsed_proxy:
+                raise ValueError(f"Could not parse proxy format: {proxy_url}")
+            
+            # Validate the parsed proxy URL format
+            if not self._is_valid_proxy_url(parsed_proxy):
+                raise ValueError(f"Invalid proxy URL format after parsing: {parsed_proxy}")
+            
+            self.session.proxies = {
+                'http': parsed_proxy,
+                'https': parsed_proxy
+            }
+        except Exception as e:
+            raise ValueError(f"Failed to configure proxy {proxy_url}: {str(e)}")
+    
+    def _parse_proxy_format(self, proxy_line: str) -> Optional[str]:
+        """Parse various proxy formats and convert to standard format."""
+        if not proxy_line or not isinstance(proxy_line, str):
+            return None
+        
+        proxy_line = proxy_line.strip()
+        if not proxy_line:
+            return None
+        
+        # Format 1: Already in standard format (http://user:pass@host:port)
+        if any(proxy_line.startswith(protocol) for protocol in ['http://', 'https://', 'socks5://', 'socks4://']):
+            return proxy_line
+        
+        # Format 2: IP:PORT:USERNAME__DOMAIN:PASSWORD (your format)
+        if proxy_line.count(':') == 3 and '__' in proxy_line:
+            try:
+                parts = proxy_line.split(':')
+                if len(parts) == 4:
+                    ip, port, username_domain, password = parts
+                    # Extract username from username__domain
+                    if '__' in username_domain:
+                        username = username_domain.split('__')[0]
+                        # Convert to standard format
+                        return f"http://{username}:{password}@{ip}:{port}"
+            except:
+                pass
+        
+        # Format 3: IP:PORT:USERNAME:PASSWORD
+        if proxy_line.count(':') == 3:
+            try:
+                parts = proxy_line.split(':')
+                if len(parts) == 4:
+                    ip, port, username, password = parts
+                    return f"http://{username}:{password}@{ip}:{port}"
+            except:
+                pass
+        
+        # Format 4: IP:PORT (no authentication)
+        if proxy_line.count(':') == 1:
+            try:
+                ip, port = proxy_line.split(':')
+                return f"http://{ip}:{port}"
+            except:
+                pass
+        
+        # Format 5: USERNAME:PASSWORD@IP:PORT
+        if '@' in proxy_line and proxy_line.count(':') == 2:
+            try:
+                auth_part, host_part = proxy_line.split('@')
+                if ':' in auth_part and ':' in host_part:
+                    return f"http://{proxy_line}"
+            except:
+                pass
+        
+        return None
+    
+    def _is_valid_proxy_url(self, proxy_url: str) -> bool:
+        """Validate proxy URL format."""
+        if not proxy_url or not isinstance(proxy_url, str):
+            return False
+        
+        # Check for valid protocols
+        valid_protocols = ['http://', 'https://', 'socks5://', 'socks4://']
+        if not any(proxy_url.startswith(protocol) for protocol in valid_protocols):
+            return False
+        
+        # Basic format validation
+        try:
+            # Remove protocol
+            url_part = proxy_url.split('://', 1)[1]
+            
+            if '@' in url_part:  # username:password@host:port
+                auth_part, host_part = url_part.split('@', 1)
+                # Check if auth part has username:password format
+                if ':' in auth_part:
+                    username, password = auth_part.split(':', 1)
+                    if not username or not password:
+                        return False
+                # Check if host part has host:port format
+                if ':' in host_part:
+                    host, port = host_part.split(':', 1)
+                    if not host or not port.isdigit():
+                        return False
+                else:
+                    return False
+            else:  # host:port (no authentication)
+                if ':' in url_part:
+                    host, port = url_part.split(':', 1)
+                    if not host or not port.isdigit():
+                        return False
+                else:
+                    return False
+            
+            return True
+        except Exception:
+            return False
+    
+    def _rotate_proxy(self):
+        """Rotate to next proxy in the list."""
+        if not self.proxy_list or len(self.proxy_list) <= 1:
+            return False
+        
+        self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
+        new_proxy = self.proxy_list[self.current_proxy_index]
+        self._configure_proxy(new_proxy)
+        return True
+    
+    def _test_proxy_connection(self, timeout: int = 10) -> bool:
+        """Test if current proxy is working."""
+        try:
+            response = self.session.get('https://httpbin.org/ip', timeout=timeout)
+            return response.status_code == 200
+        except:
+            return False
     
     def _find_key(self, data: Any, *keys: str) -> Optional[Any]:
         """Recursively search for keys in nested data structures."""
@@ -170,7 +322,7 @@ class EndesaClient:
         return response.json()
     
     def login(self):
-        """Authenticate with Endesa portal with retry mechanism for bans."""
+        """Authenticate with Endesa portal with retry mechanism for bans and proxy failures."""
         for attempt in range(self.max_retries):
             try:
                 session_key = self._get_session_key()
@@ -178,7 +330,23 @@ class EndesaClient:
                 return  # Success, exit retry loop
             except Exception as e:
                 error_msg = str(e)
-                if "BANNED:" in error_msg:
+                
+                # Handle proxy-related errors
+                if any(proxy_error in error_msg.lower() for proxy_error in ['proxy', 'connection', 'timeout', 'connect']):
+                    if self.proxy_list and len(self.proxy_list) > 1:
+                        # Try rotating proxy
+                        if self._rotate_proxy():
+                            continue  # Retry with new proxy
+                    elif attempt < self.max_retries - 1:
+                        # Single proxy with retries
+                        delay = self.retry_delay * (2 ** attempt)
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise Exception(f"PROXY_ERROR: {error_msg}")
+                
+                # Handle bans
+                elif "BANNED:" in error_msg:
                     if attempt < self.max_retries - 1:  # Not the last attempt
                         delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
                         time.sleep(delay)
