@@ -79,6 +79,7 @@ class BatchProcessorThread(QThread):
             successful = 0
             failed = 0
             banned = 0
+            stats_update_counter = 0  # Add counter for batched stats updates
             
             # Initialize VPN if enabled
             if self.use_vpn:
@@ -105,6 +106,7 @@ class BatchProcessorThread(QThread):
                 retry_credentials = []  # Store credentials for retry (bans + timeouts)
                 batch_count = 0
                 max_retries = 3  # Maximum times to retry credentials
+                global_retry_count = {}  # Persistent retry counter across all batches
                 
                 while (remaining_credentials or retry_credentials) and self.running:
                     # Prepare current batch: remaining + retry credentials
@@ -138,7 +140,7 @@ class BatchProcessorThread(QThread):
                             self.progress_updated.emit("IP rotation failed, continuing with current IP")
                     
                     # Process current batch and wait for completion (VPN mode)
-                    batch_results = self._process_batch_with_retry_tracking(current_batch, retry_credentials, max_retries)
+                    batch_results = self._process_batch_with_retry_tracking(current_batch, retry_credentials, max_retries, global_retry_count)
                     
                     # Update statistics
                     for result_type in batch_results:
@@ -163,6 +165,14 @@ class BatchProcessorThread(QThread):
                     rate = current_total / elapsed_time if elapsed_time > 0 else 0
                     self.stats_updated.emit(successful, failed, banned, current_total, rate)
                     self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%) - Retry queue: {len(retry_credentials)}")
+                    stats_update_counter += 1
+                    if stats_update_counter >= 5 or current_total >= total_credentials:  # Update stats every 5 processed items or when total credentials are processed
+                        self.progress_percentage.emit(progress_percent)
+                        elapsed_time = time.time() - self.start_time
+                        rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                        self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                        self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                        stats_update_counter = 0
             else:
                 # Normal mode: Process all credentials continuously without waiting
                 self.progress_updated.emit("Starting continuous processing (normal mode)...")
@@ -196,7 +206,7 @@ class BatchProcessorThread(QThread):
                                 if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
                                     self._write_result_to_file(result)
                                 
-                                # Emit the actual result message first (for parsing)
+                                # Emit the actual result message
                                 self.progress_updated.emit(result)
                                 
                                 # Update statistics
@@ -215,16 +225,21 @@ class BatchProcessorThread(QThread):
                                 current_total = successful + failed + banned
                                 progress_percent = int((current_total / total_credentials) * 100)
                                 
-                                # Update progress and statistics
-                                self.progress_percentage.emit(progress_percent)
-                                elapsed_time = time.time() - self.start_time
-                                rate = current_total / elapsed_time if elapsed_time > 0 else 0
-                                self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                                self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                                # Increment stats counter
+                                stats_update_counter += 1
+                                
+                                # Update progress and statistics (batched for performance)
+                                if stats_update_counter >= 5 or current_total >= total_credentials:
+                                    self.progress_percentage.emit(progress_percent)
+                                    elapsed_time = time.time() - self.start_time
+                                    rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                                    self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                                    stats_update_counter = 0
                                 
                                 # Remove from tracking
                                 del future_to_credential[future]
-                                
+                        
                             except Exception as e:
                                 email, line_num = future_to_credential[future]
                                 result = f"ERROR: Line {line_num} - {email} - {str(e)}"
@@ -298,13 +313,8 @@ class BatchProcessorThread(QThread):
                         if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
                             self._write_result_to_file(result)
                         
-                        # Emit the actual result message first (for parsing)
+                        # Emit the actual result message
                         self.progress_updated.emit(result)
-                        
-                        # Then emit the progress message (but not for login failures to avoid duplicates)
-                        if not result.startswith("LOGIN_FAILED"):
-                            progress = f"Processed: {email} - {result}"
-                            self.progress_updated.emit(progress)
                         
                         results.append(result_type)
                         
@@ -328,10 +338,10 @@ class BatchProcessorThread(QThread):
         
         return results
     
-    def _process_batch_with_retry_tracking(self, batch_credentials, retry_credentials, max_retries):
+    def _process_batch_with_retry_tracking(self, batch_credentials, retry_credentials, max_retries, global_retry_count):
         """Process a batch of credentials with retry tracking for bans and timeouts."""
         results = []
-        retry_count = {}  # Track retry count for each credential
+        # Use the global retry count passed from the main loop
         
         # Use ThreadPoolExecutor for true parallel processing
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -364,11 +374,11 @@ class BatchProcessorThread(QThread):
                         # Handle retry logic for bans and timeouts
                         if result_type in ["BANNED", "TIMEOUT"]:
                             # Check if we should retry this credential
-                            current_retry_count = retry_count.get((email, line_num), 0)
+                            current_retry_count = global_retry_count.get((email, line_num), 0)
                             if current_retry_count < max_retries:
                                 # Add to retry credentials for next batch
                                 retry_credentials.append((email, password, line_num))
-                                retry_count[(email, line_num)] = current_retry_count + 1
+                                global_retry_count[(email, line_num)] = current_retry_count + 1
                                 retry_type = "BANNED" if result_type == "BANNED" else "TIMEOUT"
                                 self.progress_updated.emit(f"{retry_type}: Line {line_num} - {email} - Will retry in next batch (attempt {current_retry_count + 1}/{max_retries})")
                                 result_type = "RETRY"  # Don't count as banned/timeout yet
@@ -383,13 +393,8 @@ class BatchProcessorThread(QThread):
                         if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
                             self._write_result_to_file(result)
                         
-                        # Emit the actual result message first (for parsing)
+                        # Emit the actual result message
                         self.progress_updated.emit(result)
-                        
-                        # Then emit the progress message (but not for login failures to avoid duplicates)
-                        if not result.startswith("LOGIN_FAILED"):
-                            progress = f"Processed: {email} - {result}"
-                            self.progress_updated.emit(progress)
                         
                         # Only add to results if not a retry
                         if result_type != "RETRY":
@@ -403,7 +408,7 @@ class BatchProcessorThread(QThread):
                         result = f"ERROR: Line {line_num} - {email} - {str(e)}"
                         self._write_result_to_file(result)
                         
-                        # Emit the actual result message first (for parsing)
+                        # Emit the actual result message
                         self.progress_updated.emit(result)
                         
                         results.append("FAILED")
@@ -1332,7 +1337,9 @@ class EndesaInterface(QMainWindow):
         
         # Initialize output management
         self.output_lines = []
-        self.max_output_lines = 1000
+        self.max_output_lines = 500  # Reduced from 1000 for better performance
+        self.batch_update_counter = 0
+        self.batch_update_threshold = 10  # Update UI every 10 messages
         
         output_tab_layout.addWidget(self.output_text)
         
@@ -1786,7 +1793,11 @@ class EndesaInterface(QMainWindow):
         self.output_text.append("Output cleared.\n")
     
     def update_progress(self, message: str):
-        """Update the progress output with memory management for large datasets."""
+        """Update the progress output with optimized memory management for large datasets."""
+        # Skip spam messages to reduce UI load
+        if message.startswith("Processed:"):
+            return  # Skip these to reduce spam
+        
         # Color code different message types
         if message.startswith("SUCCESS"):
             colored_message = f'<span style="color: #00ff00;">{message}</span>'
@@ -1862,35 +1873,51 @@ class EndesaInterface(QMainWindow):
         elif message.startswith("INVALID"):
             colored_message = f'<span style="color: #ff0000;">{message}</span>'  # Red for invalid URL satellite
         elif message.startswith("LOGIN_FAILED"):
-            colored_message = f'<span style="color: #ffa500;">{message}</span>'  # Orange for login failures
+            # Skip login failures to reduce spam - they're already counted in stats
+            return
         elif message.startswith("BANNED"):
             colored_message = f'<span style="color: #ff8800;">{message}</span>'  # Yellow for banned accounts
         elif message.startswith("SKIP"):
             colored_message = f'<span style="color: #888888;">{message}</span>'  # Gray for skipped lines
-        elif message.startswith("Processed:"):
-            colored_message = f'<span style="color: #00b4d8;">{message}</span>'
         else:
             colored_message = f'<span style="color: #ffffff;">{message}</span>'
         
         # Add to output lines list for management
         self.output_lines.append(colored_message)
         
-        # Keep only last max_output_lines for performance
-        if len(self.output_lines) > self.max_output_lines:
-            # Remove oldest lines
-            lines_to_remove = len(self.output_lines) - self.max_output_lines
-            self.output_lines = self.output_lines[lines_to_remove:]
-            
-            # Rebuild output text efficiently
-            self.output_text.clear()
-            self.output_text.append('\n'.join(self.output_lines))
-        else:
-            # Just append new line
-            self.output_text.append(colored_message)
+        # Increment batch counter
+        self.batch_update_counter += 1
         
-        # Auto-scroll to bottom
-        scrollbar = self.output_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # Efficient memory management: trim lines when limit is exceeded
+        if len(self.output_lines) > self.max_output_lines:
+            # Keep only the last 400 lines (80% of max) to reduce frequent trimming
+            keep_lines = int(self.max_output_lines * 0.8)
+            self.output_lines = self.output_lines[-keep_lines:]
+            
+            # Force UI update when we trim
+            self._update_output_display()
+            self.batch_update_counter = 0
+        elif self.batch_update_counter >= self.batch_update_threshold:
+            # Batch update UI every N messages to improve performance
+            self._update_output_display()
+            self.batch_update_counter = 0
+        elif len(self.output_lines) <= 50:
+            # For small datasets, update immediately
+            self._update_output_display()
+    
+    def _update_output_display(self):
+        """Efficiently update the output display."""
+        try:
+            # Clear and rebuild with current lines
+            self.output_text.clear()
+            self.output_text.setHtml('<br>'.join(self.output_lines))
+            
+            # Auto-scroll to bottom
+            scrollbar = self.output_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception as e:
+            # If update fails, just continue - don't crash the app
+            print(f"Output display update failed: {e}")
     
     def update_status(self, message: str):
         """Update the status label."""
