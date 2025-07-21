@@ -7,6 +7,7 @@ import os
 import sys
 import platform
 
+
 # Set environment variables for native file dialogs
 if platform.system() == "Windows":
     # Windows: Use native Windows file dialog
@@ -18,11 +19,8 @@ elif platform.system() == "Linux":
     os.environ['QT_QPA_PLATFORM'] = 'xcb'
     os.environ['QT_QPA_PLATFORMTHEME'] = ''
     os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = ''
-    # Force native file dialog
-    os.environ['GTK_USE_PORTAL'] = '1'
-    os.environ['XDG_CURRENT_DESKTOP'] = 'GNOME'  # Helps with some file managers
 
-from interface import main
+from src.ui.interface import main
 
 if __name__ == "__main__":
     main() 

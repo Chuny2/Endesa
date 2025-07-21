@@ -16,6 +16,21 @@ results.txt
 !requirements.txt
 !config.py
 
+# Credentials and sensitive data
+credentials.txt
+credentials/
+data/credentials/
+
+# Backup directories and files
+backup/
+*backup*/
+*_backup_*/
+
+# Test files and directories
+*test*.txt
+test_*
+*_test.py
+
 # IDE
 .vscode/
 .idea/

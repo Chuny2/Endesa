@@ -4,8 +4,8 @@
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from endesa import EndesaClient
-from config import read_credentials
+from src.core.endesa import EndesaClient
+from src.config.config import read_credentials
 
 
 def process_account(credential_file: str) -> str:
@@ -39,7 +39,7 @@ def process_account(credential_file: str) -> str:
         return f"ERROR: {credential_file} - {str(e)}"
 
 
-def process_credentials_directory(credentials_dir: str, max_workers: int = 50, output_file: str = "results.txt"):
+def process_credentials_directory(credentials_dir: str, max_workers: int = 50, output_file: str = "data/output/results.txt"):
     """Process all credential files in a directory concurrently."""
     # Get credential files
     credential_files = []

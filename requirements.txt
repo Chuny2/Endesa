@@ -1,3 +1,7 @@
+# System Dependencies (install before running):
+# sudo apt install zenity       # Required for native file dialogs
+# 
+# Python Dependencies:
 requests>=2.31.0
 PyQt6>=6.5.0
 evpn>=1.0.0 

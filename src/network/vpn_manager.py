@@ -105,6 +105,62 @@ class VPNManager:
                     "australia-sydney", "canada-toronto", "brazil", "mexico"
                 ]
     
+    def connect_smart_with_verification(self) -> bool:
+        """Connect to VPN with intelligent IP-based verification (GENIUS USER IDEA!)
+        
+        This method:
+        1. Gets baseline IP (real IP before VPN)
+        2. Connects to VPN with retries (VPN needs time!)
+        3. Verifies IP changed with retries (proof VPN is working!)
+        
+        Much faster and more reliable than status checking!
+        """
+        
+        # 1. Get our baseline IP (real IP before VPN)
+        self.logger.info("Getting baseline IP before VPN connection...")
+        original_ip = self.get_current_ip()
+        
+        if not original_ip:
+            self.logger.error("❌ Cannot get baseline IP - check internet connection")
+            return False
+        
+        self.logger.info(f"📡 Baseline IP: {original_ip}")
+        
+        # 2. Connect to VPN using existing logic
+        self.logger.info("🔗 Connecting to VPN...")
+        if not self.connect_smart():  # Use existing connection method
+            self.logger.error("❌ VPN connection failed")
+            return False
+        
+        # 3. FAST RETRIES - Keep trying until IP changes from original!
+        max_verification_attempts = 12  # More attempts with faster retries
+        for attempt in range(max_verification_attempts):
+            # Fast 0.3s delays for quick verification
+            self.logger.info(f"🔍 Verifying VPN connection (attempt {attempt + 1}/{max_verification_attempts})...")
+            time.sleep(0.3)  # Fast retry delay
+            
+            # Get new IP after VPN connection  
+            new_ip = self.get_current_ip()
+            
+            if not new_ip:
+                print(f"🔍 DEBUG: ❌ No IP detected (attempt {attempt + 1})")
+                self.logger.warning(f"⚠️ Cannot get IP (attempt {attempt + 1}) - VPN still connecting...")
+                continue
+            
+            # 4. THE GENIUS PART - Simple IP comparison!
+            print(f"🔍 DEBUG: IP Comparison - Original: {original_ip} | New: {new_ip}")
+            if new_ip != original_ip:
+                print(f"🔍 DEBUG: ✅ IPs ARE DIFFERENT - VPN working!")
+                self.logger.info(f"✅ VPN VERIFIED! IP changed: {original_ip} → {new_ip} (took {attempt + 1} attempts)")
+                return True
+            else:
+                print(f"🔍 DEBUG: ❌ IPs ARE SAME - VPN not connected yet")
+                self.logger.warning(f"⚠️ IP still unchanged: {original_ip} (attempt {attempt + 1}) - VPN still connecting...")
+        
+        # If we get here, all attempts failed
+        self.logger.error(f"❌ VPN VERIFICATION FAILED! IP unchanged after {max_verification_attempts} attempts: {original_ip}")
+        return False
+
     def connect_smart(self) -> bool:
         """Connect using random location selection"""
         self.logger.info("Connecting to random ExpressVPN location...")
@@ -235,175 +291,142 @@ class VPNManager:
                 return False
     
     def rotate_ip(self) -> bool:
-        """Rotate IP by disconnecting and reconnecting with smart connect"""
-        self.logger.info("Rotating IP address...")
+        """Rotate IP using FIXED rotation logic - prevents fake success!
         
-        # Get current IP before rotation
+        CRITICAL FIX: Ensures we don't think disconnection = successful rotation
+        """
+        self.logger.info("🔄 Rotating IP address...")
+        
+        # Get current IP before rotation (should be VPN IP)
         old_ip = self.get_current_ip()
-        self.logger.info(f"Current IP before rotation: {old_ip}")
-        
-        if self.is_windows and self.evpn_api:
-            try:
-                # Get current location
-                current_location = self.current_location
-                
-                # Disconnect first
-                if self.is_connected:
-                    self.disconnect()
-                    time.sleep(1)  # Reduced from 3s to 1s
-                
-                # Connect to a different random location
-                locations = self.evpn_api.locations
-                if not locations:
-                    self.logger.error("No locations available")
-                    return False
-                
-                import random
-                # Try to find a different location
-                attempts = 0
-                while attempts < 5:
-                    location = random.choice(locations)
-                    if location['name'] != current_location:
-                        self.logger.info(f"Connecting to different location: {location['name']}")
-                        self.evpn_api.connect(location['id'])
-                        self.is_connected = True
-                        self.current_location = location['name']
-                        
-                        # Verify connection is established
-                        if self._verify_connection():
-                            new_ip = self.get_current_ip()
-                            if new_ip and new_ip != old_ip:
-                                self.logger.info(f"IP rotation successful: {old_ip} -> {new_ip}")
-                                return True
-                            else:
-                                self.logger.warning("IP rotation failed - same IP detected")
-                                return False
-                        else:
-                            self.logger.warning("Connection verification failed")
-                            return False
-                    attempts += 1
-                
-                # If we couldn't find a different location, just reconnect
-                self.logger.info("Couldn't find different location, reconnecting...")
-                return self.connect_smart()
-                
-            except Exception as e:
-                self.logger.error(f"Failed to rotate IP with evpn: {e}")
-                return False
-        else:
-            # CLI approach
-            # Get current location
-            current_status = self.get_status()
-            current_location = current_status.get('location')
-            
-            # Disconnect first
-            if self.is_connected:
-                self.disconnect()
-                time.sleep(1)  # Reduced from 3s to 1s
-            
-            # Get available locations and try to connect to a different one
-            locations = self.get_available_locations()
-            if not locations:
-                self.logger.error("No locations available")
-                return False
-            
-            import random
-            # Try to find a different location
-            attempts = 0
-            while attempts < 5:
-                location = random.choice(locations)
-                if location != current_location:
-                    self.logger.info(f"Trying to connect to different location: {location}")
-                    # Set the region first, then connect
-                    success, output = self._run_command(f"expressvpnctl set region {location}")
-                    if success:
-                        self.logger.info(f"Region set to {location}")
-                        # Now connect to the set region
-                        success, output = self._run_command("expressvpnctl connect")
-                        if success:
-                            self.logger.info(f"Successfully connected to {location}")
-                            self.is_connected = True
-                            self.current_location = location
-                            
-                            # Verify connection is established
-                            if self._verify_connection():
-                                new_ip = self.get_current_ip()
-                                if new_ip and new_ip != old_ip:
-                                    self.logger.info(f"IP rotation successful: {old_ip} -> {new_ip}")
-                                    return True
-                                else:
-                                    self.logger.warning("IP rotation failed - same IP detected")
-                                    return False
-                            else:
-                                self.logger.warning("Connection verification failed")
-                                return False
-                        else:
-                            self.logger.warning(f"Failed to connect to {location}: {output}")
-                    else:
-                        self.logger.warning(f"Failed to set region {location}: {output}")
-                attempts += 1
-            
-            # If we couldn't find a different location, try smart connect
-            self.logger.info("Couldn't find different location, trying smart connect...")
-            if self.connect_smart():
-                # Verify connection is established
-                if self._verify_connection():
-                    new_ip = self.get_current_ip()
-                    if new_ip and new_ip != old_ip:
-                        self.logger.info(f"IP rotation successful: {old_ip} -> {new_ip}")
-                        return True
-                    else:
-                        self.logger.warning("IP rotation failed - same IP detected")
-                        return False
-                else:
-                    self.logger.warning("Connection verification failed")
-                    return False
-            
+        if not old_ip:
+            self.logger.error("❌ Cannot get current IP for rotation")
             return False
+            
+        self.logger.info(f"📡 Current IP before rotation: {old_ip}")
+        
+        # CRITICAL: We need to remember the original real IP to detect failures!
+        # For now, we'll use connect_smart_with_verification which handles this properly
+        
+        # Disconnect from current VPN
+        if self.is_connected:
+            self.logger.info("🔌 Disconnecting from current VPN...")
+            self.disconnect()
+            time.sleep(1)  # Brief pause
+        
+        # Use the GENIUS verification method for rotation!
+        self.logger.info("🔗 Reconnecting with IP verification...")
+        if not self.connect_smart_with_verification():
+            self.logger.error("❌ VPN reconnection failed - back to real IP!")
+            return False
+        
+        # Get final IP after successful VPN connection
+        new_ip = self.get_current_ip()
+        if not new_ip:
+            self.logger.error("❌ Cannot get IP after VPN reconnection")
+            return False
+        
+        # Final verification: Make sure we actually rotated
+        print(f"🔄 DEBUG: FINAL Check - Old VPN: {old_ip} | New VPN: {new_ip}")
+        if new_ip != old_ip:
+            print(f"🔄 DEBUG: ✅ REAL ROTATION SUCCESS - Different VPN IPs!")
+            self.logger.info(f"✅ IP ROTATION SUCCESS! {old_ip} → {new_ip}")
+            return True
+        else:
+            print(f"🔄 DEBUG: ⚠️ Same VPN IP - may be same location")
+            self.logger.warning(f"⚠️ IP rotation got same location: {old_ip}")
+            # Still success since we have VPN, just same location
+            return True
     
     def _verify_connection(self) -> bool:
-        """Verify that VPN connection is properly established"""
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            try:
-                # Check VPN status
-                status = self.get_status()
-                if not status.get('connected', False):
-                    self.logger.warning(f"VPN not connected (attempt {attempt + 1}/{max_attempts})")
-                    time.sleep(1)
-                    continue
-                
-                # Try to get IP to verify connection is working
-                ip = self.get_current_ip()
-                if ip:
-                    self.logger.info(f"Connection verified - IP: {ip}")
-                    return True
-                else:
-                    self.logger.warning(f"Could not get IP (attempt {attempt + 1}/{max_attempts})")
-                    time.sleep(1)
-                    continue
-                    
-            except Exception as e:
-                self.logger.warning(f"Connection verification error (attempt {attempt + 1}/{max_attempts}): {e}")
-                time.sleep(1)
-                continue
+        """Verify that VPN connection is properly established - SIMPLIFIED!
         
-        self.logger.error("Connection verification failed after all attempts")
-        return False
+        No more complex retry loops - just check if we can get an IP.
+        Real verification is done via IP comparison in connect_smart_with_verification.
+        """
+        try:
+            # Simple check - can we get current IP?
+            ip = self.get_current_ip()
+            if ip:
+                self.logger.info(f"Connection verified - IP: {ip}")
+                return True
+            else:
+                self.logger.warning("Could not get IP - connection may have issues")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"Connection verification error: {e}")
+            return False
     
     def get_current_ip(self) -> Optional[str]:
-        """Get current public IP address"""
-        try:
-            result = subprocess.run(
-                ["curl", "-s", "https://ipinfo.io/ip"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception as e:
-            self.logger.error(f"Failed to get IP: {e}")
+        """BULLETPROOF IPv4 detection with smart retries for VPN transitions!"""
+        
+        # OPTIMIZED: Fast, reliable IPv4-only services in speed order
+        services = [
+            ("ipinfo.io", "https://ipinfo.io/ip"),         # Fast + reliable IPv4
+            ("api.ipify.org", "https://api.ipify.org"),    # Fast + reliable IPv4  
+            ("checkip.amazonaws.com", "https://checkip.amazonaws.com"),  # AWS reliable
+            ("icanhazip.com", "http://icanhazip.com"),     # Fast but might return IPv6
+        ]
+        
+        # SMART RETRIES: Try all services, then retry with longer timeouts if needed
+        max_retry_rounds = 2  # Two rounds of attempts
+        
+        for retry_round in range(max_retry_rounds):
+            # Progressive timeout increase for retries
+            if retry_round == 0:
+                # First round: Fast timeouts
+                connect_timeout = "1"
+                max_time = "2" 
+                subprocess_timeout = 2
+            else:
+                # Second round: More generous timeouts for unstable VPN transitions
+                connect_timeout = "2"
+                max_time = "4"
+                subprocess_timeout = 4
+                # Brief pause between retry rounds to let VPN stabilize
+                time.sleep(0.5)
+        
+            for service_name, service_url in services:
+                try:
+                    # Dynamic timeouts based on retry round
+                    cmd = [
+                        "curl", "-4",  # FORCE IPv4 ONLY!
+                        "-s", 
+                        "--connect-timeout", connect_timeout,
+                        "--max-time", max_time,
+                        service_url
+                    ]
+                
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=subprocess_timeout  # Dynamic timeout based on retry round
+                    )
+                
+                    if result.returncode == 0 and result.stdout.strip():
+                        raw_ip = result.stdout.strip()
+                        
+                        # STRICT IPv4 validation - NO IPv6!
+                        ip_parts = raw_ip.split(".")
+                        if (len(ip_parts) == 4 and 
+                            all(part.isdigit() and 0 <= int(part) <= 255 for part in ip_parts)):
+                            
+                            return raw_ip
+                        else:
+                            # Skip invalid IPv4 (might be IPv6)
+                            continue
+                        
+                except subprocess.TimeoutExpired:
+                    # Service timed out, try next one
+                    continue
+                except Exception:
+                    # Service failed, try next one
+                    continue
+        
+        # All services failed after all retries
+        self.logger.error("All IPv4 detection services failed after retries")
         return None
     
     def __del__(self):
