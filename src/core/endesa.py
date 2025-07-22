@@ -8,6 +8,7 @@ import random
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
+from .session_pool import SessionPool, SessionPoolManager
 
 
 class EndesaClient:
@@ -16,69 +17,44 @@ class EndesaClient:
     BASE_URL = "https://www.endesaclientes.com"
     AUTH_URL = "https://accounts.enel.com/samlsso"
     
-    def __init__(self, email: str, password: str, max_workers: int = 10, max_retries: int = 3, retry_delay: float = 2.0, proxy: Optional[str] = None, proxy_list: Optional[List[str]] = None):
+    def __init__(self, email: str, password: str, session_pool: SessionPool, max_retries: int = 3, retry_delay: float = 2.0, proxy: Optional[str] = None):
         self.email = email
         self.password = password
-        self.session = requests.Session()
+        self.session_pool = session_pool
         self.session_id = None
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.proxy = proxy
-        self.proxy_list = proxy_list or []
-        self.current_proxy_index = 0
         
-        # Configure proxy if provided
+        # Parse and normalize proxy if provided
         if proxy:
-            self._configure_proxy(proxy)
-        elif self.proxy_list:
-            # Ensure proxy_list contains strings, not lists
-            if self.proxy_list and isinstance(self.proxy_list[0], str):
-                self._configure_proxy(self.proxy_list[0])
-            else:
-                raise ValueError(f"Invalid proxy list format: {self.proxy_list}")
-        
-        # Optimize session for large datasets
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
-            'Accept': 'text/plain, */*; q=0.01',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'X-Requested-With': 'XMLHttpRequest'
-        })
-        
-        # Scale connection pool based on thread count
-        # Each thread needs connections to multiple hosts
-        connections_per_host = max(10, max_workers // 2)  # At least 10, or half of max_workers
-        
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=5,     # 5 different hosts (fixed)
-            pool_maxsize=connections_per_host,  # Scale with thread count
-            max_retries=1
-        )
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
+            self.parsed_proxy = self._parse_proxy_format(proxy)
+            if not self.parsed_proxy:
+                raise ValueError(f"Could not parse proxy format: {proxy}")
+            if not self._is_valid_proxy_url(self.parsed_proxy):
+                raise ValueError(f"Invalid proxy URL format after parsing: {self.parsed_proxy}")
+        else:
+            self.parsed_proxy = None
     
-    def _configure_proxy(self, proxy_url: str):
-        """Configure proxy for the session."""
-        try:
-            # Ensure proxy_url is a string, not a list
-            if isinstance(proxy_url, list):
-                raise ValueError(f"Expected proxy string, got list: {proxy_url}")
-            
-            # Parse and convert proxy format if needed
-            parsed_proxy = self._parse_proxy_format(proxy_url)
-            if not parsed_proxy:
-                raise ValueError(f"Could not parse proxy format: {proxy_url}")
-            
-            # Validate the parsed proxy URL format
-            if not self._is_valid_proxy_url(parsed_proxy):
-                raise ValueError(f"Invalid proxy URL format after parsing: {parsed_proxy}")
-            
+    def __enter__(self):
+        """Context manager entry - get session from pool."""
+        self.session = self.session_pool.get_session()
+        
+        # Configure proxy for this session if needed
+        if self.parsed_proxy:
             self.session.proxies = {
-                'http': parsed_proxy,
-                'https': parsed_proxy
+                'http': self.parsed_proxy,
+                'https': self.parsed_proxy
             }
-        except Exception as e:
-            raise ValueError(f"Failed to configure proxy {proxy_url}: {str(e)}")
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - return session to pool."""
+        if hasattr(self, 'session') and self.session:
+            had_error = exc_type is not None
+            self.session_pool.return_session(self.session, had_error)
+            self.session = None
     
     def _parse_proxy_format(self, proxy_line: str) -> Optional[str]:
         """Parse various proxy formats and convert to standard format."""
@@ -177,23 +153,7 @@ class EndesaClient:
         except Exception:
             return False
     
-    def _rotate_proxy(self):
-        """Rotate to next proxy in the list."""
-        if not self.proxy_list or len(self.proxy_list) <= 1:
-            return False
-        
-        self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
-        new_proxy = self.proxy_list[self.current_proxy_index]
-        self._configure_proxy(new_proxy)
-        return True
-    
-    def _test_proxy_connection(self, timeout: int = 10) -> bool:
-        """Test if current proxy is working."""
-        try:
-            response = self.session.get('https://httpbin.org/ip', timeout=timeout)
-            return response.status_code == 200
-        except:
-            return False
+
     
     def _find_key(self, data: Any, *keys: str) -> Optional[Any]:
         """Recursively search for keys in nested data structures."""
@@ -322,7 +282,7 @@ class EndesaClient:
         return response.json()
     
     def login(self):
-        """Authenticate with Endesa portal with retry mechanism for bans and proxy failures."""
+        """Authenticate with Endesa portal with retry mechanism for bans and connection failures."""
         for attempt in range(self.max_retries):
             try:
                 session_key = self._get_session_key()
@@ -331,22 +291,9 @@ class EndesaClient:
             except Exception as e:
                 error_msg = str(e)
                 
-                # Handle proxy-related errors
-                if any(proxy_error in error_msg.lower() for proxy_error in ['proxy', 'connection', 'timeout', 'connect']):
-                    if self.proxy_list and len(self.proxy_list) > 1:
-                        # Try rotating proxy
-                        if self._rotate_proxy():
-                            continue  # Retry with new proxy
-                    elif attempt < self.max_retries - 1:
-                        # Single proxy with retries
-                        delay = self.retry_delay * (2 ** attempt)
-                        time.sleep(delay)
-                        continue
-                    else:
-                        raise Exception(f"PROXY_ERROR: {error_msg}")
-                
-                # Handle bans
-                elif "BANNED:" in error_msg:
+                # Handle bans and connection errors with retries
+                if "BANNED:" in error_msg or any(error_type in error_msg.lower() 
+                   for error_type in ['proxy', 'connection', 'timeout', 'connect']):
                     if attempt < self.max_retries - 1:  # Not the last attempt
                         delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
                         time.sleep(delay)
@@ -354,7 +301,7 @@ class EndesaClient:
                     else:
                         raise  # Last attempt failed, re-raise the exception
                 else:
-                    raise  # Non-ban error, don't retry
+                    raise  # Non-retryable error, don't retry
     
     def get_account_info(self) -> Dict[str, str]:
         """Retrieve account information including IBAN and phone with retry mechanism for bans."""
@@ -393,8 +340,9 @@ class EndesaClient:
                     raise  # Non-ban error, don't retry
     
     def close(self):
-        """Close the session."""
-        self.session.close()
+        """Close method for backward compatibility. Session management is now handled by context manager."""
+        # Sessions are managed by the pool, no action needed here
+        pass
 
 
 def main():
