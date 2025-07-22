@@ -154,8 +154,8 @@ class SimplifiedProxyPanel(QWidget):
     def __init__(self):
         super().__init__()
         
-        # Initialize proxy manager
-        self.proxy_manager = ProxyManager(auto_remove_failed=True, max_failures=1)
+        # Initialize proxy manager with auto-removal DISABLED by default
+        self.proxy_manager = ProxyManager(auto_remove_failed=False, max_failures=1)
         self.proxy_manager.proxy_removed.connect(self._on_proxy_auto_removed)
         
         self.test_thread: Optional[ProxyTestThread] = None
@@ -457,6 +457,9 @@ class SimplifiedProxyPanel(QWidget):
             self._on_testing_finished()
             return
         
+        # ENABLE auto-removal during testing
+        self.proxy_manager.auto_remove_failed = True
+        
         # Start new test
         self.test_button.setText("⏹️ Stop Testing")
         self.progress_bar.setVisible(True)
@@ -536,6 +539,9 @@ class SimplifiedProxyPanel(QWidget):
     
     def _on_testing_finished(self):
         """Handle testing completion."""
+        # DISABLE auto-removal after testing
+        self.proxy_manager.auto_remove_failed = False
+        
         self.test_button.setText("🧪 Test All Proxies")
         self.progress_bar.setVisible(False)
         self._update_display()
@@ -622,39 +628,74 @@ class SimplifiedProxyPanel(QWidget):
             print(f"Error updating proxy table: {e}")
     
     def _open_native_file_dialog(self, title="Select File", file_types="*", start_dir=None):
-        """Open native OS file dialog."""
+        """Open native OS file dialog - CROSS-PLATFORM with Windows support!"""
         try:
+            import platform
             if start_dir is None:
                 start_dir = os.getcwd()
             
-            # Try zenity first
-            try:
-                cmd = [
-                    'zenity', '--file-selection',
-                    '--title=' + title,
-                    '--filename=' + start_dir + '/'
-                ]
-                
-                if file_types != "*":
-                    cmd.extend(['--file-filter=' + file_types + ' | ' + file_types])
-                    cmd.extend(['--file-filter=All files | *'])
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-                return None
-            except (subprocess.SubprocessError, FileNotFoundError):
-                pass
+            # WINDOWS - Use PowerShell native dialog
+            if platform.system() == "Windows":
+                try:
+                    # Convert file_types for Windows filter
+                    if file_types == "*":
+                        filter_str = "All files (*.*)|*.*"
+                    else:
+                        # Convert "*.txt" to "Text files (*.txt)|*.txt|All files (*.*)|*.*"
+                        ext_display = file_types.replace("*.", "").upper() + " files"
+                        filter_str = f"{ext_display} ({file_types})|{file_types}|All files (*.*)|*.*"
+                    
+                    # PowerShell script for native Windows file dialog
+                    ps_script = f'''
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = "{title}"
+$dialog.InitialDirectory = "{start_dir.replace('/', '\\')}"
+$dialog.Filter = "{filter_str}"
+$result = $dialog.ShowDialog()
+if ($result -eq "OK") {{
+    $dialog.FileName
+}}
+'''
+                    result = subprocess.run(
+                        ['powershell', '-Command', ps_script], 
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.strip()
+                    return None
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
             
-            # Try kdialog
-            try:
-                cmd = ['kdialog', '--getopenfilename', start_dir, file_types]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-                return None
-            except (subprocess.SubprocessError, FileNotFoundError):
-                pass
+            # LINUX - Try zenity first
+            else:
+                try:
+                    cmd = [
+                        'zenity', '--file-selection',
+                        '--title=' + title,
+                        '--filename=' + start_dir + '/'
+                    ]
+                    
+                    if file_types != "*":
+                        cmd.extend(['--file-filter=' + file_types + ' | ' + file_types])
+                        cmd.extend(['--file-filter=All files | *'])
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.strip()
+                    return None
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
+                
+                # Try kdialog
+                try:
+                    cmd = ['kdialog', '--getopenfilename', start_dir, file_types]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.strip()
+                    return None
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
             
             return None
                 
