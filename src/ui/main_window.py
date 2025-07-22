@@ -150,6 +150,15 @@ class MainWindow(QMainWindow):
         # Create and start processor thread
         proxy_manager = proxy_config.get('proxy_manager') if proxy_config['enabled'] else None
         
+       
+        processing_proxy_manager = None
+        if proxy_manager:
+            from src.network.proxy_manager import ProxyManager
+            # Copiar la lista de proxies actual
+            proxy_list_copy = list(proxy_manager.proxy_list)
+            # Crear nueva instancia sin auto-eliminación
+            processing_proxy_manager = ProxyManager(proxy_list=proxy_list_copy, auto_remove_failed=False, max_failures=proxy_manager.max_failures)
+        
         self.processor_thread = BatchProcessorThread(
             config['credentials_file'], 
             config['max_workers'], 
@@ -162,8 +171,8 @@ class MainWindow(QMainWindow):
         )
         
         # Set proxy manager in processor thread if enabled
-        if proxy_manager:
-            self.processor_thread.proxy_manager = proxy_manager
+        if processing_proxy_manager:
+            self.processor_thread.proxy_manager = processing_proxy_manager
             self.processor_thread.proxy_strategy = proxy_config.get('strategy', 'round_robin')
         
         # Connect thread signals
