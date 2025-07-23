@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Endesa client for retrieving account information."""
 
-import json
 import re
 import time
-import random
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
-from .session_pool import SessionPool, SessionPoolManager
 
 
 class EndesaClient:
@@ -17,44 +14,58 @@ class EndesaClient:
     BASE_URL = "https://www.endesaclientes.com"
     AUTH_URL = "https://accounts.enel.com/samlsso"
     
-    def __init__(self, email: str, password: str, session_pool: SessionPool, max_retries: int = 3, retry_delay: float = 2.0, proxy: Optional[str] = None):
+    def __init__(self, email: str, password: str, max_workers: int = 10, proxy: Optional[str] = None):
         self.email = email
         self.password = password
-        self.session_pool = session_pool
+        self.session = requests.Session()
         self.session_id = None
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
         self.proxy = proxy
         
-        # Parse and normalize proxy if provided
+        # Configure proxy if provided
         if proxy:
-            self.parsed_proxy = self._parse_proxy_format(proxy)
-            if not self.parsed_proxy:
-                raise ValueError(f"Could not parse proxy format: {proxy}")
-            if not self._is_valid_proxy_url(self.parsed_proxy):
-                raise ValueError(f"Invalid proxy URL format after parsing: {self.parsed_proxy}")
-        else:
-            self.parsed_proxy = None
-    
-    def __enter__(self):
-        """Context manager entry - get session from pool."""
-        self.session = self.session_pool.get_session()
+            self._configure_proxy(proxy)
         
-        # Configure proxy for this session if needed
-        if self.parsed_proxy:
+        # Configure session headers
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+            'Accept': 'text/plain, */*; q=0.01',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'X-Requested-With': 'XMLHttpRequest'
+        })
+        
+        # Configure connection pool
+        connections_per_host = max(10, max_workers // 2)
+        
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=5,
+            pool_maxsize=connections_per_host,
+            max_retries=1
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+    
+    def _configure_proxy(self, proxy_url: str):
+        """Configure proxy for the session."""
+        try:
+            # Ensure proxy_url is a string, not a list
+            if isinstance(proxy_url, list):
+                raise ValueError(f"Expected proxy string, got list: {proxy_url}")
+            
+            # Parse and convert proxy format if needed
+            parsed_proxy = self._parse_proxy_format(proxy_url)
+            if not parsed_proxy:
+                raise ValueError(f"Could not parse proxy format: {proxy_url}")
+            
+            # Validate the parsed proxy URL format
+            if not self._is_valid_proxy_url(parsed_proxy):
+                raise ValueError(f"Invalid proxy URL format after parsing: {parsed_proxy}")
+            
             self.session.proxies = {
-                'http': self.parsed_proxy,
-                'https': self.parsed_proxy
+                'http': parsed_proxy,
+                'https': parsed_proxy
             }
-        
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - return session to pool."""
-        if hasattr(self, 'session') and self.session:
-            had_error = exc_type is not None
-            self.session_pool.return_session(self.session, had_error)
-            self.session = None
+        except Exception as e:
+            raise ValueError(f"Failed to configure proxy {proxy_url}: {str(e)}")
     
     def _parse_proxy_format(self, proxy_line: str) -> Optional[str]:
         """Parse various proxy formats and convert to standard format."""
@@ -65,23 +76,22 @@ class EndesaClient:
         if not proxy_line:
             return None
         
-        # Format 1: Already in standard format (http://user:pass@host:port)
-        if any(proxy_line.startswith(protocol) for protocol in ['http://', 'https://', 'socks5://', 'socks4://']):
+        # Format 1: Already in standard format
+        if '://' in proxy_line:
             return proxy_line
         
-        # Format 2: IP:PORT:USERNAME__DOMAIN:PASSWORD (your format)
-        if proxy_line.count(':') == 3 and '__' in proxy_line:
-            try:
-                parts = proxy_line.split(':')
-                if len(parts) == 4:
-                    ip, port, username_domain, password = parts
-                    # Extract username from username__domain
-                    if '__' in username_domain:
-                        username = username_domain.split('__')[0]
-                        # Convert to standard format
-                        return f"http://{username}:{password}@{ip}:{port}"
-            except:
-                pass
+        # Format 2: IP:PORT:USERNAME__DOMAIN:PASSWORD
+        if proxy_line.count(':') >= 3 and '__' in proxy_line:
+            parts = proxy_line.split(':')
+            host, port = parts[0], parts[1]
+            # Extract username from username__domain
+            username_domain = parts[2]
+            if '__' in username_domain:
+                username = username_domain.split('__')[0]
+            else:
+                username = username_domain
+            password = parts[3] if len(parts) > 3 else ""
+            return f"http://{username}:{password}@{host}:{port}"
         
         # Format 3: IP:PORT:USERNAME:PASSWORD
         if proxy_line.count(':') == 3:
@@ -154,7 +164,6 @@ class EndesaClient:
             return False
     
 
-    
     def _find_key(self, data: Any, *keys: str) -> Optional[Any]:
         """Recursively search for keys in nested data structures."""
         if isinstance(data, dict):
@@ -282,100 +291,38 @@ class EndesaClient:
         return response.json()
     
     def login(self):
-        """Authenticate with Endesa portal with retry mechanism for bans and connection failures."""
-        for attempt in range(self.max_retries):
-            try:
-                session_key = self._get_session_key()
-                self._authenticate(session_key)
-                return  # Success, exit retry loop
-            except Exception as e:
-                error_msg = str(e)
-                
-                # Handle bans and connection errors with retries
-                if "BANNED:" in error_msg or any(error_type in error_msg.lower() 
-                   for error_type in ['proxy', 'connection', 'timeout', 'connect']):
-                    if attempt < self.max_retries - 1:  # Not the last attempt
-                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        time.sleep(delay)
-                        continue  # Retry
-                    else:
-                        raise  # Last attempt failed, re-raise the exception
-                else:
-                    raise  # Non-retryable error, don't retry
+        """Authenticate with Endesa portal - no retry logic (handled by RetryManager)."""
+        session_key = self._get_session_key()
+        self._authenticate(session_key)
     
     def get_account_info(self) -> Dict[str, str]:
-        """Retrieve account information including IBAN and phone with retry mechanism for bans."""
+        """Retrieve account information including IBAN and phone - no retry logic (handled by RetryManager)."""
         if not self.session_id:
             raise Exception("Not authenticated")
         
-        for attempt in range(self.max_retries):
-            try:
-                user_data = self._get_user_info()
-                client_id, contract_number = self._extract_account_data(user_data)
-                contract_data = self._get_contract_info(client_id, contract_number)
-                
-                # Extract IBAN and phone
-                iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
-                phone = (
-                    self._find_key(contract_data, "phone", "phonenumber") or
-                    user_data.get("contactPerson", {}).get("phone")
-                )
-                
-                return {
-                    "client_id": client_id,
-                    "contract_number": contract_number,
-                    "iban": iban,
-                    "phone": phone
-                }
-            except Exception as e:
-                error_msg = str(e)
-                if "BANNED:" in error_msg:
-                    if attempt < self.max_retries - 1:  # Not the last attempt
-                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        time.sleep(delay)
-                        continue  # Retry
-                    else:
-                        raise  # Last attempt failed, re-raise the exception
-                else:
-                    raise  # Non-ban error, don't retry
+        user_data = self._get_user_info()
+        client_id, contract_number = self._extract_account_data(user_data)
+        contract_data = self._get_contract_info(client_id, contract_number)
+        
+        # Extract IBAN and phone
+        iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
+        phone = (
+            self._find_key(contract_data, "phone", "phonenumber") or
+            user_data.get("contactPerson", {}).get("phone")
+        )
+        
+        return {
+            "client_id": client_id,
+            "contract_number": contract_number,
+            "iban": iban,
+            "phone": phone
+        }
     
     def close(self):
-        """Close method for backward compatibility. Session management is now handled by context manager."""
-        # Sessions are managed by the pool, no action needed here
-        pass
+        """Close the session."""
+        self.session.close()
 
 
-def main():
-    """Main function to demonstrate usage."""
-    try:
-        # Read credentials from file
-        with open("credentials.txt", "r") as f:
-            line = f.readline().strip()
-            if ":" not in line:
-                print("Invalid credentials file format. Use: email:password")
-                return
-            email, password = line.split(":", 1)
-        
-        # Create client and retrieve data
-        client = EndesaClient(email.strip(), password.strip())
-        
-        client.login()
-        account_info = client.get_account_info()
-        
-        # Display results
-        print(f"IBAN: {account_info['iban']} Phone: {account_info['phone']}")
-        
-    except FileNotFoundError:
-        print("credentials.txt not found. Create it with format: email:password")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if 'client' in locals():
-            client.close()
-
-
-if __name__ == "__main__":
-    main()
 
 
 

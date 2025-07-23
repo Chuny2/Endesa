@@ -15,7 +15,6 @@ from src.core.processing_thread import BatchProcessorThread
 from src.ui.styles import MAIN_WINDOW_STYLE, apply_main_styles
 from src.ui.components import ConfigPanel, ControlPanel, ResultsPanel
 from src.ui.components.proxy_panel_simple import SimplifiedProxyPanel
-from src.core.endesa import EndesaClient
 
 
 class MainWindow(QMainWindow):
@@ -117,10 +116,6 @@ class MainWindow(QMainWindow):
         # Control panel signals
         self.control_panel.start_processing.connect(self.start_processing)
         self.control_panel.stop_processing.connect(self.stop_processing)
-        
-        # Config panel signals (if needed for future features)
-        # self.config_panel.credentials_file_changed.connect(self.on_credentials_changed)
-        # self.config_panel.vpn_status_changed.connect(self.on_vpn_changed)
     
     def start_processing(self):
         """Start the batch processing."""
@@ -157,7 +152,7 @@ class MainWindow(QMainWindow):
             # Copiar la lista de proxies actual
             proxy_list_copy = list(proxy_manager.proxy_list)
             # Crear nueva instancia sin auto-eliminación
-            processing_proxy_manager = ProxyManager(proxy_list=proxy_list_copy, auto_remove_failed=False, max_failures=proxy_manager.max_failures)
+            processing_proxy_manager = ProxyManager(proxy_list=proxy_list_copy, auto_remove_failed=False)
         
         self.processor_thread = BatchProcessorThread(
             config['credentials_file'], 
@@ -165,9 +160,7 @@ class MainWindow(QMainWindow):
             "data/output/results.txt",
             config['max_retries'], 
             config['retry_delay'], 
-            config['use_vpn'], 
-            None,  # No single proxy - using proxy manager
-            []     # No proxy list - using proxy manager
+            config['use_vpn']
         )
         
         # Set proxy manager in processor thread if enabled

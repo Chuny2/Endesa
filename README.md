@@ -11,7 +11,7 @@ Fast batch processor for Endesa accounts with modern GUI.
 
 2. **Run:**
    ```bash
-   python interface.py
+   python main.py
    ```
 
 3. **Use:**
@@ -48,7 +48,7 @@ user2@example.com:pass123
 
 **Alternative Formats:**
 - `IP:PORT:USERNAME:PASSWORD`
-- `IP:PORT:USERNAME__DOMAIN:PASSWORD` (your format)
+- `IP:PORT:USERNAME__DOMAIN:PASSWORD`
 - `USERNAME:PASSWORD@IP:PORT`
 
 ### Single Proxy
@@ -72,10 +72,10 @@ http://user2:pass2@host2:port2
 
 ## Files
 
-- `interface.py` - Main GUI (run this)
-- `endesa.py` - Core client
+- `main.py` - Main GUI (run this)
+- `src/core/endesa.py` - Core client
 - `credentials.txt` - Your credentials
-- `results.txt` - Output file
+- `data/output/results.txt` - Output file
 
 ## Tips
 
