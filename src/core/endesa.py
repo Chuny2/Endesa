@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Endesa client for retrieving account information."""
 
-import json
 import re
 import time
-import random
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
@@ -16,28 +14,18 @@ class EndesaClient:
     BASE_URL = "https://www.endesaclientes.com"
     AUTH_URL = "https://accounts.enel.com/samlsso"
     
-    def __init__(self, email: str, password: str, max_workers: int = 10, max_retries: int = 3, retry_delay: float = 2.0, proxy: Optional[str] = None, proxy_list: Optional[List[str]] = None):
+    def __init__(self, email: str, password: str, max_workers: int = 10, proxy: Optional[str] = None):
         self.email = email
         self.password = password
         self.session = requests.Session()
         self.session_id = None
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
         self.proxy = proxy
-        self.proxy_list = proxy_list or []
-        self.current_proxy_index = 0
         
         # Configure proxy if provided
         if proxy:
             self._configure_proxy(proxy)
-        elif self.proxy_list:
-            # Ensure proxy_list contains strings, not lists
-            if self.proxy_list and isinstance(self.proxy_list[0], str):
-                self._configure_proxy(self.proxy_list[0])
-            else:
-                raise ValueError(f"Invalid proxy list format: {self.proxy_list}")
         
-        # Optimize session for large datasets
+        # Configure session headers
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
             'Accept': 'text/plain, */*; q=0.01',
@@ -45,13 +33,12 @@ class EndesaClient:
             'X-Requested-With': 'XMLHttpRequest'
         })
         
-        # Scale connection pool based on thread count
-        # Each thread needs connections to multiple hosts
-        connections_per_host = max(10, max_workers // 2)  # At least 10, or half of max_workers
+        # Configure connection pool
+        connections_per_host = max(10, max_workers // 2)
         
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=5,     # 5 different hosts (fixed)
-            pool_maxsize=connections_per_host,  # Scale with thread count
+            pool_connections=5,
+            pool_maxsize=connections_per_host,
             max_retries=1
         )
         self.session.mount('http://', adapter)
@@ -89,23 +76,22 @@ class EndesaClient:
         if not proxy_line:
             return None
         
-        # Format 1: Already in standard format (http://user:pass@host:port)
-        if any(proxy_line.startswith(protocol) for protocol in ['http://', 'https://', 'socks5://', 'socks4://']):
+        # Format 1: Already in standard format
+        if '://' in proxy_line:
             return proxy_line
         
-        # Format 2: IP:PORT:USERNAME__DOMAIN:PASSWORD (your format)
-        if proxy_line.count(':') == 3 and '__' in proxy_line:
-            try:
-                parts = proxy_line.split(':')
-                if len(parts) == 4:
-                    ip, port, username_domain, password = parts
-                    # Extract username from username__domain
-                    if '__' in username_domain:
-                        username = username_domain.split('__')[0]
-                        # Convert to standard format
-                        return f"http://{username}:{password}@{ip}:{port}"
-            except:
-                pass
+        # Format 2: IP:PORT:USERNAME__DOMAIN:PASSWORD
+        if proxy_line.count(':') >= 3 and '__' in proxy_line:
+            parts = proxy_line.split(':')
+            host, port = parts[0], parts[1]
+            # Extract username from username__domain
+            username_domain = parts[2]
+            if '__' in username_domain:
+                username = username_domain.split('__')[0]
+            else:
+                username = username_domain
+            password = parts[3] if len(parts) > 3 else ""
+            return f"http://{username}:{password}@{host}:{port}"
         
         # Format 3: IP:PORT:USERNAME:PASSWORD
         if proxy_line.count(':') == 3:
@@ -177,24 +163,7 @@ class EndesaClient:
         except Exception:
             return False
     
-    def _rotate_proxy(self):
-        """Rotate to next proxy in the list."""
-        if not self.proxy_list or len(self.proxy_list) <= 1:
-            return False
-        
-        self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
-        new_proxy = self.proxy_list[self.current_proxy_index]
-        self._configure_proxy(new_proxy)
-        return True
-    
-    def _test_proxy_connection(self, timeout: int = 10) -> bool:
-        """Test if current proxy is working."""
-        try:
-            response = self.session.get('https://httpbin.org/ip', timeout=timeout)
-            return response.status_code == 200
-        except:
-            return False
-    
+
     def _find_key(self, data: Any, *keys: str) -> Optional[Any]:
         """Recursively search for keys in nested data structures."""
         if isinstance(data, dict):
@@ -322,112 +291,38 @@ class EndesaClient:
         return response.json()
     
     def login(self):
-        """Authenticate with Endesa portal with retry mechanism for bans and proxy failures."""
-        for attempt in range(self.max_retries):
-            try:
-                session_key = self._get_session_key()
-                self._authenticate(session_key)
-                return  # Success, exit retry loop
-            except Exception as e:
-                error_msg = str(e)
-                
-                # Handle proxy-related errors
-                if any(proxy_error in error_msg.lower() for proxy_error in ['proxy', 'connection', 'timeout', 'connect']):
-                    if self.proxy_list and len(self.proxy_list) > 1:
-                        # Try rotating proxy
-                        if self._rotate_proxy():
-                            continue  # Retry with new proxy
-                    elif attempt < self.max_retries - 1:
-                        # Single proxy with retries
-                        delay = self.retry_delay * (2 ** attempt)
-                        time.sleep(delay)
-                        continue
-                    else:
-                        raise Exception(f"PROXY_ERROR: {error_msg}")
-                
-                # Handle bans
-                elif "BANNED:" in error_msg:
-                    if attempt < self.max_retries - 1:  # Not the last attempt
-                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        time.sleep(delay)
-                        continue  # Retry
-                    else:
-                        raise  # Last attempt failed, re-raise the exception
-                else:
-                    raise  # Non-ban error, don't retry
+        """Authenticate with Endesa portal - no retry logic (handled by RetryManager)."""
+        session_key = self._get_session_key()
+        self._authenticate(session_key)
     
     def get_account_info(self) -> Dict[str, str]:
-        """Retrieve account information including IBAN and phone with retry mechanism for bans."""
+        """Retrieve account information including IBAN and phone - no retry logic (handled by RetryManager)."""
         if not self.session_id:
             raise Exception("Not authenticated")
         
-        for attempt in range(self.max_retries):
-            try:
-                user_data = self._get_user_info()
-                client_id, contract_number = self._extract_account_data(user_data)
-                contract_data = self._get_contract_info(client_id, contract_number)
-                
-                # Extract IBAN and phone
-                iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
-                phone = (
-                    self._find_key(contract_data, "phone", "phonenumber") or
-                    user_data.get("contactPerson", {}).get("phone")
-                )
-                
-                return {
-                    "client_id": client_id,
-                    "contract_number": contract_number,
-                    "iban": iban,
-                    "phone": phone
-                }
-            except Exception as e:
-                error_msg = str(e)
-                if "BANNED:" in error_msg:
-                    if attempt < self.max_retries - 1:  # Not the last attempt
-                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        time.sleep(delay)
-                        continue  # Retry
-                    else:
-                        raise  # Last attempt failed, re-raise the exception
-                else:
-                    raise  # Non-ban error, don't retry
+        user_data = self._get_user_info()
+        client_id, contract_number = self._extract_account_data(user_data)
+        contract_data = self._get_contract_info(client_id, contract_number)
+        
+        # Extract IBAN and phone
+        iban = self._find_key(contract_data, "iban", "ibanaccount", "accountiban")
+        phone = (
+            self._find_key(contract_data, "phone", "phonenumber") or
+            user_data.get("contactPerson", {}).get("phone")
+        )
+        
+        return {
+            "client_id": client_id,
+            "contract_number": contract_number,
+            "iban": iban,
+            "phone": phone
+        }
     
     def close(self):
         """Close the session."""
         self.session.close()
 
 
-def main():
-    """Main function to demonstrate usage."""
-    try:
-        # Read credentials from file
-        with open("credentials.txt", "r") as f:
-            line = f.readline().strip()
-            if ":" not in line:
-                print("Invalid credentials file format. Use: email:password")
-                return
-            email, password = line.split(":", 1)
-        
-        # Create client and retrieve data
-        client = EndesaClient(email.strip(), password.strip())
-        
-        client.login()
-        account_info = client.get_account_info()
-        
-        # Display results
-        print(f"IBAN: {account_info['iban']} Phone: {account_info['phone']}")
-        
-    except FileNotFoundError:
-        print("credentials.txt not found. Create it with format: email:password")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if 'client' in locals():
-            client.close()
-
-
-if __name__ == "__main__":
-    main()
 
 
 

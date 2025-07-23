@@ -141,11 +141,16 @@ class ResultsPanel(QWidget):
         elif message.startswith("INVALID"):
             colored_message = f'<span style="color: #ff0000;">{message}</span>'
         elif message.startswith("LOGIN_FAILED"):
-            return  # Skip login failures to reduce spam
+            colored_message = f'<span style="color: #ff0000;">{message}</span>'
         elif message.startswith("BANNED"):
             colored_message = f'<span style="color: #ff8800;">{message}</span>'
         elif message.startswith("SKIP"):
             colored_message = f'<span style="color: #888888;">{message}</span>'
+        elif message.startswith("LOGGIN_ERROR"):
+            colored_message = f'<span style="color: #ff6666;">{message}</span>'
+        elif message.startswith("TIMEOUT"):
+            colored_message = f'<span style="color: #ff9900;">{message}</span>'
+
         else:
             colored_message = f'<span style="color: #ffffff;">{message}</span>'
         
@@ -155,22 +160,18 @@ class ResultsPanel(QWidget):
         # Increment batch counter
         self.batch_update_counter += 1
         
-        # Efficient memory management: trim lines when limit is exceeded
+        # Trim lines when limit exceeded
         if len(self.output_lines) > self.max_output_lines:
-            # Keep only the last 80% of max lines to reduce frequent trimming
             keep_lines = int(self.max_output_lines * 0.8)
             self.output_lines = self.output_lines[-keep_lines:]
             
-            # Force UI update when we trim
+            # Update display and reset counter
             self._update_output_display()
             self.batch_update_counter = 0
+        # Update display periodically
         elif self.batch_update_counter >= self.batch_update_threshold:
-            # Batch update UI every N messages to improve performance
             self._update_output_display()
             self.batch_update_counter = 0
-        elif len(self.output_lines) <= 50:
-            # For small datasets, update immediately
-            self._update_output_display()
     
     def _parse_and_add_success_entry(self, message: str):
         """Parse success message and add to table."""

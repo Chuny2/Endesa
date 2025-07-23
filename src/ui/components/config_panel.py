@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QSpinBox, QCheckBox, QLineEdit
 )
 import subprocess
-import shlex
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 
@@ -22,9 +21,7 @@ from src.ui.styles import (
 class ConfigPanel(QWidget):
     """Configuration panel for batch processor settings."""
     
-    # Signals for configuration changes
-    credentials_file_changed = pyqtSignal(str)
-    vpn_status_changed = pyqtSignal(bool)
+
     
     def __init__(self):
         super().__init__()
@@ -147,7 +144,6 @@ class ConfigPanel(QWidget):
         self.vpn_status_indicator.setStyleSheet(VPN_DISABLED_STYLE)
         
         self.vpn_checkbox.toggled.connect(self._update_vpn_status_indicator)
-        self.vpn_checkbox.toggled.connect(self.vpn_status_changed.emit)
         
         vpn_layout.addWidget(self.vpn_checkbox)
         vpn_layout.addWidget(self.vpn_status_indicator)
@@ -207,7 +203,31 @@ if ($result -eq "OK") {{
                         return result.stdout.strip()
                     return None
                 except (subprocess.SubprocessError, FileNotFoundError):
-                    pass
+                    # Fallback to zenity if available
+                    try:
+                        if file_types == "*":
+                            filter_arg = ""
+                        else:
+                            filter_arg = f"--file-filter={file_types}"
+                        
+                        cmd = ["zenity", "--file-selection", "--title", title]
+                        if filter_arg:
+                            cmd.append(filter_arg)
+                        
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                        if result.returncode == 0:
+                            return result.stdout.strip()
+                        return None
+                    except (subprocess.SubprocessError, FileNotFoundError):
+                        # Final fallback to kdialog
+                        try:
+                            cmd = ["kdialog", "--getopenfilename", start_dir, file_types]
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                            if result.returncode == 0:
+                                return result.stdout.strip()
+                            return None
+                        except (subprocess.SubprocessError, FileNotFoundError):
+                            pass
             
             # LINUX - Try zenity first (most common on Linux)
             else:
@@ -226,7 +246,6 @@ if ($result -eq "OK") {{
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                     if result.returncode == 0 and result.stdout.strip():
                         return result.stdout.strip()
-                    # User canceled - that's fine, return None
                     return None
                 except (subprocess.SubprocessError, FileNotFoundError):
                     pass
@@ -237,7 +256,6 @@ if ($result -eq "OK") {{
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                     if result.returncode == 0 and result.stdout.strip():
                         return result.stdout.strip()
-                    # User canceled - that's fine, return None
                     return None
                 except (subprocess.SubprocessError, FileNotFoundError):
                     pass
@@ -258,7 +276,6 @@ if ($result -eq "OK") {{
         self.credentials_file = file_path
         self.credentials_path_label.setText(file_path)
         self.credentials_path_label.setStyleSheet(FILE_SELECTED_STYLE)
-        self.credentials_file_changed.emit(file_path)
     
     def _update_vpn_status_indicator(self, checked: bool):
         """Update the VPN status indicator based on checkbox state."""

@@ -18,22 +18,19 @@ class ProxyManager(QObject):
     proxy_removed = pyqtSignal(str, str)  # (proxy, reason)
     
     def __init__(self, proxy_list: Optional[List[str]] = None, 
-                 timeout: int = 3, max_failures: int = 3, auto_remove_failed: bool = True):
+                 timeout: int = 3, auto_remove_failed: bool = True):
         """
         Initialize the proxy manager.
         
         Args:
             proxy_list: List of proxy URLs (format: protocol://ip:port or protocol://user:pass@ip:port)
             timeout: Timeout for proxy validation requests
-            max_failures: Maximum consecutive failures before marking proxy as unhealthy
             auto_remove_failed: Automatically remove proxies that fail repeatedly
         """
         super().__init__()  # Initialize QObject
         self.proxy_list = proxy_list or []
         self.timeout = timeout
-        self.max_failures = max_failures
         self.auto_remove_failed = auto_remove_failed  # Auto-remove failed proxies
-        self.current_proxy_index = 0
         self.proxy_health: Dict[str, Dict] = {}
         self.test_urls = [
             "http://httpbin.org/ip",
@@ -107,12 +104,6 @@ class ProxyManager(QObject):
         - IP:PORT:USER:PASS
         - IP:PORT:USERNAME__DOMAIN:PASSWORD
         - USER:PASS@IP:PORT
-        
-        Args:
-            proxy: Proxy URL string
-            
-        Returns:
-            bool: True if format is valid
         """
         if not proxy or not proxy.strip():
             return False
@@ -120,18 +111,18 @@ class ProxyManager(QObject):
         proxy = proxy.strip()
         
         try:
-            # Format 1: Full URL with scheme (http://host:port, socks5://user:pass@host:port)
+            # Full URL with scheme
             if '://' in proxy:
                 parsed = urlparse(proxy)
                 return bool(parsed.scheme and parsed.hostname and parsed.port)
             
-            # Format 2: USER:PASS@IP:PORT or USERNAME:PASSWORD@IP:PORT
+            # USER:PASS@IP:PORT format
             elif '@' in proxy:
                 auth_part, server_part = proxy.split('@', 1)
-                # Validate auth part (should have at least one colon for user:pass)
+                # Validate auth part
                 if ':' not in auth_part:
                     return False
-                # Validate server part (should be IP:PORT or HOST:PORT)
+                # Validate server part
                 if ':' not in server_part:
                     return False
                 parts = server_part.split(':')
@@ -140,7 +131,7 @@ class ProxyManager(QObject):
                 host, port = parts
                 return bool(host.strip() and port.strip().isdigit() and 1 <= int(port) <= 65535)
             
-            # Format 3: IP:PORT:USER:PASS or IP:PORT:USERNAME__DOMAIN:PASSWORD
+            # IP:PORT:USER:PASS format
             elif proxy.count(':') >= 3:
                 parts = proxy.split(':')
                 if len(parts) < 4:
@@ -326,6 +317,7 @@ class ProxyManager(QObject):
             response = requests.get(test_url, proxies=proxy_dict, timeout=self.timeout)
             response_time = time.time() - start_time
             
+            # Record result
             if response.status_code == 200:
                 self._record_success(proxy, response_time)
                 return True, response_time
@@ -350,7 +342,7 @@ class ProxyManager(QObject):
         if not self.proxy_list:
             return results
         
-        # Adaptive batch configuration for massive datasets
+        # Configure batching based on dataset size
         total_proxies = len(self.proxy_list)
         
         if total_proxies <= 100:
@@ -366,35 +358,32 @@ class ProxyManager(QObject):
             max_workers = 20
             batch_delay = 0.05
         else:
-            # Massive dataset optimization
             batch_size = 200
             max_workers = 25
             batch_delay = 0.1
         
         completed = 0
         
-        # Process proxies in adaptive batches
+        # Process proxies in batches
         for i in range(0, total_proxies, batch_size):
             batch = self.proxy_list[i:i + batch_size]
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit current batch
                 futures = {
                     executor.submit(self._test_proxy_ultra_fast, proxy): proxy 
                     for proxy in batch
                 }
                 
-                # Collect batch results with aggressive timeout
-                for future in as_completed(futures, timeout=10):  # Reduced timeout
+                # Collect batch results
+                for future in as_completed(futures, timeout=10):
                     proxy = futures[future]
                     try:
-                        is_working, response_time = future.result(timeout=0.5)  # Very fast timeout
+                        is_working, response_time = future.result(timeout=0.5)
                         results[proxy] = (is_working, response_time)
                         completed += 1
                         
-                        # Throttled progress callbacks for performance
+                        # Progress callbacks
                         if progress_callback and total_proxies > 1000:
-                            # For large datasets, very infrequent callbacks
                             if completed % 100 == 0 or completed == total_proxies:
                                 progress_callback(completed, total_proxies)
                         elif progress_callback and (completed % 20 == 0 or completed == total_proxies):
@@ -404,31 +393,29 @@ class ProxyManager(QObject):
                         results[proxy] = (False, 0.0)
                         completed += 1
             
-            # Adaptive delay between batches
+            # Delay between batches
             if batch_delay > 0:
-                import time
                 time.sleep(batch_delay)
         
         return results
     
     def _test_proxy_ultra_fast(self, proxy: str):
-        """Ultra-fast proxy testing with minimal overhead and aggressive timeouts."""
+        """Ultra-fast proxy testing with minimal overhead."""
         try:
-            # Direct implementation for maximum speed
             normalized_proxy = self._normalize_proxy_for_requests(proxy)
             proxy_dict = {'http': normalized_proxy, 'https': normalized_proxy}
             
             start_time = time.time()
             response = requests.get(
-                "http://httpbin.org/ip",  # Fast endpoint
+                "http://httpbin.org/ip",
                 proxies=proxy_dict, 
-                timeout=1.5,  # Very aggressive timeout
+                timeout=1.5,
                 headers={'User-Agent': 'FastTest/1.0'},
-                allow_redirects=False  # Don't follow redirects for speed
+                allow_redirects=False
             )
             response_time = time.time() - start_time
             
-            # Record result directly for performance
+            # Record result
             if response.status_code == 200:
                 self._record_success(proxy, response_time)
                 return True, response_time
@@ -440,9 +427,7 @@ class ProxyManager(QObject):
             self._record_failure(proxy)
             return False, 0.0
     
-    def _test_proxy_safe(self, proxy: str):
-        """Fallback method for compatibility."""
-        return self._test_proxy_ultra_fast(proxy)
+
     
     def _record_success(self, proxy: str, response_time: float):
         """Record a successful proxy usage."""
@@ -474,10 +459,6 @@ class ProxyManager(QObject):
                 # Remove from health tracking
                 if proxy in self.proxy_health:
                     del self.proxy_health[proxy]
-                
-                # Adjust current index if needed
-                if self.current_proxy_index >= len(self.proxy_list) and self.proxy_list:
-                    self.current_proxy_index = 0
                 
                 # Emit signal for UI notification
                 reason = f"Failed testing"
@@ -525,7 +506,7 @@ class ProxyManager(QObject):
             health_snapshot = dict(self.proxy_health)
             return sum(1 for health in health_snapshot.values() if health['is_healthy'])
         except Exception:
-            # Fallback: count proxies with healthy status directly
+            # Count healthy proxies directly
             return sum(1 for proxy in list(self.proxy_list) 
                       if self.proxy_health.get(proxy, {}).get('is_healthy', False))
     
@@ -575,59 +556,5 @@ class ProxyManager(QObject):
         """Clear all proxies from the list."""
         self.proxy_list.clear()
         self.proxy_health.clear()
-        self.current_proxy_index = 0
     
-    def rotate_proxy(self) -> Optional[str]:
-        """
-        Rotate to the next proxy (alias for get_next_proxy for backward compatibility).
-        
-        Returns:
-            str: Next proxy URL or None if no proxies available
-        """
-        return self.get_next_proxy()
-
-
-class ProxyRotator:
-    """Simple proxy rotator for backward compatibility."""
-    
-    def __init__(self, proxy_list: List[str]):
-        """Initialize with a list of proxies."""
-        self.manager = ProxyManager(proxy_list)
-    
-    def get_next_proxy(self) -> Optional[str]:
-        """Get the next proxy in rotation."""
-        return self.manager.get_next_proxy()
-    
-    def get_random_proxy(self) -> Optional[str]:
-        """Get a random proxy."""
-        return self.manager.get_random_proxy()
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Example proxy list (these are example proxies, replace with real ones)
-    example_proxies = [
-        "http://proxy1.example.com:8080",
-        "http://user:pass@proxy2.example.com:3128",
-        "socks5://proxy3.example.com:1080"
-    ]
-    
-    # Create proxy manager
-    manager = ProxyManager(example_proxies)
-    
-    # Test all proxies
-    print("Testing all proxies...")
-    results = manager.test_all_proxies()
-    for proxy, (working, time) in results.items():
-        status = "✓" if working else "✗"
-        print(f"{status} {proxy} - Response time: {time:.2f}s")
-    
-    # Get next proxy
-    proxy = manager.get_next_proxy()
-    print(f"\nNext proxy: {proxy}")
-    
-    # Get proxy statistics
-    stats = manager.get_proxy_stats()
-    print(f"\nProxy statistics:")
-    for proxy, stat in stats.items():
-        print(f"  {proxy}: {stat}") 
+ 

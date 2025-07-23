@@ -70,7 +70,7 @@ class ProxyTestThread(QThread):
                             completed_count += 1
                             completed_futures += 1
                     
-                    # Ensure ALL proxies in batch were processed
+                    # Check all futures completed
                     if completed_futures < len(batch):
                         print(f"⚠️ {len(batch) - completed_futures} proxies timed out - marking as failed")
                         for future, proxy in futures.items():
@@ -149,13 +149,11 @@ class ProxyTestThread(QThread):
 class SimplifiedProxyPanel(QWidget):
     """Simplified proxy management panel with clean interface."""
     
-    proxy_configuration_changed = pyqtSignal()
-    
     def __init__(self):
         super().__init__()
         
         # Initialize proxy manager
-        self.proxy_manager = ProxyManager(auto_remove_failed=True, max_failures=1)
+        self.proxy_manager = ProxyManager(auto_remove_failed=True)
         self.proxy_manager.proxy_removed.connect(self._on_proxy_auto_removed)
         
         self.test_thread: Optional[ProxyTestThread] = None
@@ -422,7 +420,6 @@ class SimplifiedProxyPanel(QWidget):
         self.cleanup_button.setEnabled(enabled and len(self.proxy_manager.proxy_list) > 0)
         
         self._update_display()
-        self.proxy_configuration_changed.emit()
     
     def _load_proxy_file(self):
         """Load proxies from file using native dialog."""
