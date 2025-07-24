@@ -4,7 +4,8 @@
 import os
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Tuple, Dict
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -237,77 +238,176 @@ class BatchProcessorThread(QThread):
         return successful, failed, banned
     
 
+
     def _process_vpn_mode_chunked(self, credentials_reader: CredentialsReader, total_credentials: int) -> Tuple[int, int, int]:
-        """Process credentials in VPN mode using chunked processing for memory efficiency."""
-        self.progress_updated.emit("Starting VPN mode processing...")
-        
+        """
+        Process credentials in VPN mode using chunked processing, with deferred retries.
+    
+        Banned credentials are not immediately retried in the same batch. Instead, they
+        are placed into a queue and only re‑processed after the next VPN rotation.
+        """
+        pending_retries: deque = deque()  # holds (email, password, line_num, retry_count)
         successful = 0
         failed = 0
         banned = 0
         batch_count = 0
-        
-        # Process each chunk from the reader
+    
         for chunk in credentials_reader.read_chunks():
             if not self.running:
                 break
             
-            # Filter out invalid lines and emit SKIP messages for them
-            valid_credentials = []
+            # Collect new credentials from this chunk and assign retry_count = 0
+            # Also emit a message for invalid lines
+            remaining_credentials: List[Tuple[str, str, int, int]] = []
             for email, password, line_num in chunk:
                 if email == "INVALID_LINE":
-                    # password contains the invalid line content, line_num is correct
                     self.progress_updated.emit(f"SKIP: Line {line_num} - Invalid format (missing ':')")
                     continue
-                valid_credentials.append((email, password, line_num))
-            
-            if not valid_credentials:
+                remaining_credentials.append((email, password, line_num, 0))
+    
+            # If no new work and no retries, skip
+            if not remaining_credentials and not pending_retries:
                 continue
             
-            # Process this chunk in VPN batches (same as original VPN logic)
-            remaining_credentials = valid_credentials.copy()
-            
-            while remaining_credentials and self.running:
-                # Prepare current batch
-                batch_size = min(self.max_workers, len(remaining_credentials))
-                current_batch = remaining_credentials[:batch_size]
-                remaining_credentials = remaining_credentials[batch_size:]
+            # Process until we've exhausted new credentials and pending retries
+            while (remaining_credentials or pending_retries) and self.running:
+                current_batch: List[Tuple[str, str, int, int]] = []
+    
+                # Fill the batch with pending retries first
+                while pending_retries and len(current_batch) < self.max_workers:
+                    current_batch.append(pending_retries.popleft())
+    
+                # Then fill the rest of the batch with new credentials
+                while remaining_credentials and len(current_batch) < self.max_workers:
+                    current_batch.append(remaining_credentials.pop(0))
+    
+                if not current_batch:
+                    break
                 
                 batch_count += 1
-                self.progress_updated.emit(f"Processing batch {batch_count} ({len(current_batch)} credentials)...")
-                
-                # Handle VPN connection/rotation
+    
+                # VPN connection and rotation logic
                 if batch_count == 1:
-                    self.progress_updated.emit("🔗 Connecting to VPN with proper verification...")
+                    self.progress_updated.emit("🔗 Connecting to VPN with proper verification…")
                     if self.vpn_manager.connect_with_proper_verification():
                         self.progress_updated.emit("✅ VPN connected and verified!")
                     else:
                         self.progress_updated.emit("❌ VPN connection failed, continuing without VPN")
                         self.use_vpn = False
                 else:
-                    self.progress_updated.emit("🔄 Rotating IP for next batch...")
+                    self.progress_updated.emit("🔄 Rotating IP for next batch…")
                     if self.vpn_manager.rotate_ip():
                         self.progress_updated.emit("✅ IP rotated successfully")
                     else:
                         self.progress_updated.emit("⚠️ IP rotation failed, continuing with current IP")
-                
-                # Process current batch
-                batch_successful, batch_failed, batch_banned = self._process_batch_vpn(current_batch)
-                
-                # Update totals
-                successful += batch_successful
-                failed += batch_failed
-                banned += batch_banned
-                
-                # Update progress
+    
+                # Collect banned credentials from this batch to retry later
+                next_retries: deque = deque()
+    
+                # Process the batch concurrently
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_meta: Dict = {
+                        executor.submit(self._attempt_credential, email, password, line_num): (email, password, line_num, retry_count)
+                        for (email, password, line_num, retry_count) in current_batch
+                    }
+    
+                    for future in as_completed(future_to_meta):
+                        email, password, line_num, retry_count = future_to_meta[future]
+                        try:
+                            result, result_type = future.result(timeout=30)
+                            # Write successful results to file
+                            if result.startswith(("SUCCESS:", "NO_DATA:")):
+                                self._write_result_to_file(result)
+                            # Emit the result message
+                            self.progress_updated.emit(result)
+    
+                            # Update counters and collect retries
+                            if result_type in {"SUCCESS", "NO_DATA"}:
+                                successful += 1
+                            elif result_type == "BANNED":
+                                if retry_count < self.max_retries:
+                                    # Defer this banned credential to the next batch
+                                    next_retries.append((email, password, line_num, retry_count + 1))
+                                else:
+                                    banned += 1
+                            else:
+                                failed += 1
+    
+                        except Exception as exc:
+                            # Handle unexpected errors
+                            failed += 1
+                            err_msg = f"ERROR: Line {line_num} - {email} - {exc}"
+                            self._write_result_to_file(err_msg)
+                            self.progress_updated.emit(err_msg)
+    
+                # After processing this batch, set pending_retries to the newly banned ones
+                pending_retries = next_retries
+    
+                # Update progress and stats
                 current_total = successful + failed + banned
                 progress_percent = int((current_total / total_credentials) * 100)
                 self.progress_percentage.emit(progress_percent)
+    
                 elapsed_time = time.time() - self.start_time
-                rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                rate = current_total / elapsed_time if elapsed_time > 0 else 0.0
                 self.stats_updated.emit(successful, failed, banned, current_total, rate)
                 self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
-        
+    
+        # If there are still retries left after all chunks, process them in additional batches
+        while pending_retries and self.running:
+            batch_count += 1
+            self.progress_updated.emit("🔄 Rotating IP for next batch…")
+            if self.vpn_manager.rotate_ip():
+                self.progress_updated.emit("✅ IP rotated successfully")
+            else:
+                self.progress_updated.emit("⚠️ IP rotation failed, continuing with current IP")
+    
+            current_batch: List[Tuple[str, str, int, int]] = []
+            while pending_retries and len(current_batch) < self.max_workers:
+                current_batch.append(pending_retries.popleft())
+    
+            next_retries: deque = deque()
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_meta = {
+                    executor.submit(self._attempt_credential, email, password, line_num): (email, password, line_num, retry_count)
+                    for (email, password, line_num, retry_count) in current_batch
+                }
+                for future in as_completed(future_to_meta):
+                    email, password, line_num, retry_count = future_to_meta[future]
+                    try:
+                        result, result_type = future.result(timeout=30)
+                        if result.startswith(("SUCCESS:", "NO_DATA:")):
+                            self._write_result_to_file(result)
+                        self.progress_updated.emit(result)
+                        if result_type in {"SUCCESS", "NO_DATA"}:
+                            successful += 1
+                        elif result_type == "BANNED":
+                            if retry_count < self.max_retries:
+                                next_retries.append((email, password, line_num, retry_count + 1))
+                            else:
+                                banned += 1
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        failed += 1
+                        err_msg = f"ERROR: Line {line_num} - {email} - {exc}"
+                        self._write_result_to_file(err_msg)
+                        self.progress_updated.emit(err_msg)
+    
+            pending_retries = next_retries
+    
+            # Update progress for this extra batch
+            current_total = successful + failed + banned
+            progress_percent = int((current_total / total_credentials) * 100)
+            self.progress_percentage.emit(progress_percent)
+    
+            elapsed_time = time.time() - self.start_time
+            rate = current_total / elapsed_time if elapsed_time > 0 else 0.0
+            self.stats_updated.emit(successful, failed, banned, current_total, rate)
+            self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+    
         return successful, failed, banned
+    
 
     
     def _process_batch_vpn(self, batch_credentials: List[Tuple[str, str, int]]) -> Tuple[int, int, int]:
