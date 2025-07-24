@@ -105,7 +105,7 @@ class VPNManager:
             max_verification_attempts = 30  # 30 seconds max
             
             for attempt in range(max_verification_attempts):
-                time.sleep(1)  # Wait exactly 1 second as requested
+                time.sleep(1)  
                 
                 new_ip = self.get_current_ip()
                 if not new_ip:
@@ -129,7 +129,7 @@ class VPNManager:
                     else:
                         self.logger.warning(f"⚠️ DNS resolution failed, trying different location...")
                         self.disconnect()
-                        time.sleep(2)
+                        #ime.sleep(2)
                         break  # Break inner loop to try next location
             
             # If we get here, IP didn't change within 30 seconds
@@ -338,7 +338,7 @@ class VPNManager:
         success_rate = (successful_resolutions / total_tests) * 100 if total_tests > 0 else 0
         
         # Consider DNS working if at least 70% of tests pass
-        dns_working = success_rate >= 70.0
+        dns_working = success_rate >= 50.0
         
         if dns_working:
             self.logger.info(f"✅ DNS Resolution Verified: {successful_resolutions}/{total_tests} tests passed ({success_rate:.1f}%)")
@@ -347,28 +347,6 @@ class VPNManager:
         
         return dns_working
     
-    def test_dns_quick(self) -> bool:
-        """
-        Quick DNS test with minimal logging - useful for standalone testing.
-        
-        Returns:
-            bool: True if basic DNS resolution is working
-        """
-        test_domains = ["google.com", "cloudflare.com"]
-        
-        for domain in test_domains:
-            try:
-                socket.setdefaulttimeout(3)
-                result = socket.getaddrinfo(domain, None, socket.AF_INET)
-                if result and len(result) > 0:
-                    self.logger.info(f"✅ DNS Quick Test: {domain} resolves OK")
-                    return True
-            except Exception as e:
-                self.logger.warning(f"❌ DNS Quick Test: {domain} failed - {e}")
-            finally:
-                socket.setdefaulttimeout(None)
-        
-        return False
     
     def __del__(self):
         """Cleanup when object is destroyed"""

