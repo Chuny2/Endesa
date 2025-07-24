@@ -157,7 +157,7 @@ class MainWindow(QMainWindow):
         self.processor_thread = BatchProcessorThread(
             config['credentials_file'], 
             config['max_workers'], 
-            "data/output/results.txt",
+            "results.txt",
             config['max_retries'], 
             config['retry_delay'], 
             config['use_vpn']
